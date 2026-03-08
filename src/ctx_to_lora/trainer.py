@@ -231,12 +231,11 @@ class DistillationTrainer(ModulatedModelTrainer):
                 total_loss = total_loss + self.basis_diversity_coef * basis_div_loss
 
         # Compute coefficient entropy for logging
-        # gen_loras[1] is coefficients for HyperDistillModel
+        # _ is coefficient logits for HyperDistillModel
         if isinstance(_, torch.Tensor) and _.dim() == 2:
-            # _ is coefficients (batch, n_basis)
-            coefficients = _
+            coeff_probs = torch.softmax(_, dim=-1)
             eps = 1e-8
-            coeff_entropy = -(coefficients * (coefficients + eps).log()).sum(dim=-1).mean()
+            coeff_entropy = -(coeff_probs * (coeff_probs + eps).log()).sum(dim=-1).mean()
         #####
 
         scaler = self.args.gradient_accumulation_steps if is_train else 1
@@ -415,7 +414,14 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
         self.gen_lora_l1_reg_coef = kwargs.pop("gen_lora_l1_reg_coef", 0.0)
         self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
         self.basis_diversity_coef = kwargs.pop("basis_diversity_coef", 0.0)
+        self._eval_prompt_indices = kwargs.pop("eval_prompt_indices", None)
         super().__init__(*args, **kwargs)
+
+        # Cache for logging intermediate values
+        self._last_basis_loras = None
+        self._last_hyper_loras = None
+        self._last_coefficients = None
+        self._step_start_time = None
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -501,8 +507,8 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
                     loss = torch.tensor(0.0, device=outputs.logits.device)
             else:
                 # Fallback: CE loss on labels
+                logger.warning("No teacher and no pre-computed logprobs. Falling back to CE loss.")
                 logits = outputs.logits
-                from ctx_to_lora.trainer import causal_lm_ce_loss
                 loss = causal_lm_ce_loss(logits, labels, unwrapped.vocab_size)
 
         if self.use_per_ctx_average_loss:
@@ -546,12 +552,13 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             basis_div_loss = unwrapped.basis_bank.compute_diversity_loss()
             total_loss = total_loss + self.basis_diversity_coef * basis_div_loss
 
-        # Coefficient entropy
+        # Coefficient entropy (coefficients are logits; apply softmax first)
         coeff_entropy = torch.tensor(0.0, device=loss.device)
         if isinstance(coefficients, torch.Tensor) and coefficients.dim() == 2:
+            coeff_probs = torch.softmax(coefficients, dim=-1)
             eps = 1e-8
             coeff_entropy = -(
-                coefficients * (coefficients + eps).log()
+                coeff_probs * (coeff_probs + eps).log()
             ).sum(dim=-1).mean()
 
         scaler = self.args.gradient_accumulation_steps if is_train else 1
@@ -559,21 +566,169 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             total_loss *= self.accelerator.num_processes
             scaler *= self.accelerator.num_processes
 
-        if (self.state.global_step == 1 and self.args.logging_first_step) or (
-            self.args.logging_strategy == IntervalStrategy.STEPS
-            and self.state.global_step % self.state.logging_steps == 0
-        ):
+        is_logging_step = (
+            (self.state.global_step == 1 and self.args.logging_first_step)
+            or (
+                self.args.logging_strategy == IntervalStrategy.STEPS
+                and self.state.global_step % self.state.logging_steps == 0
+            )
+        )
+
+        if is_logging_step:
             log_dict = {
-                "kl_loss": loss.item() * scaler,
-                "gen_lora_l1_norm": l1_norm.item() * scaler,
+                "loss/kl": loss.item() * scaler,
+                "loss/l1_reg": (l1_norm.item() * scaler if isinstance(l1_norm, torch.Tensor) else l1_norm * scaler),
+                "loss/basis_diversity": basis_div_loss.item() * scaler,
+                "loss/total": total_loss.item() * scaler,
             }
-            if self.basis_diversity_coef > 0:
-                log_dict["basis_diversity_loss"] = basis_div_loss.item() * scaler
-            if coeff_entropy.item() > 0:
-                log_dict["coefficient_entropy"] = coeff_entropy.item()
+
+            # Coefficient stats
+            if isinstance(coefficients, torch.Tensor) and coefficients.dim() == 2:
+                coeff_probs = torch.softmax(coefficients, dim=-1)
+                log_dict["coefficients/entropy"] = coeff_entropy.item()
+                log_dict["coefficients/max"] = coeff_probs.max(dim=-1).values.mean().item()
+
+            # LoRA norm stats
+            if gen_loras is not None:
+                self._log_lora_norms(log_dict, gen_loras, unwrapped)
+
+            # Gradient norms
+            self._log_gradient_norms(log_dict, unwrapped)
+
+            # Learning rate
+            if self.lr_scheduler is not None:
+                log_dict["lr/current"] = self.lr_scheduler.get_last_lr()[0]
+
             self.log(log_dict)
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    def _log_lora_norms(self, log_dict, gen_loras, unwrapped):
+        """Log Frobenius norms of basis and hyper LoRAs."""
+        total_basis_norm = 0.0
+        total_hyper_norm = 0.0
+        n_basis_entries = 0
+        n_hyper_entries = 0
+
+        for mname, lora in gen_loras.items():
+            if "A" in lora:
+                # Old format
+                norm_a = lora["A"].norm().item()
+                norm_b = lora["B"].norm().item()
+                log_dict[f"lora_norm/{mname}_A"] = norm_a
+                log_dict[f"lora_norm/{mname}_B"] = norm_b
+            else:
+                # Per-layer format: aggregate across layers
+                norm_a = sum(ab["A"].norm().item() for ab in lora.values())
+                norm_b = sum(ab["B"].norm().item() for ab in lora.values())
+                total_hyper_norm += norm_a + norm_b
+                n_hyper_entries += len(lora)
+
+        # Basis bank norms
+        if hasattr(unwrapped, "basis_bank") and unwrapped.basis_bank is not None:
+            for vname in unwrapped.basis_bank.module_specs:
+                ba = unwrapped.basis_bank.basis_A[vname].norm().item()
+                bb = unwrapped.basis_bank.basis_B[vname].norm().item()
+                total_basis_norm += ba + bb
+                n_basis_entries += 1
+
+        if n_basis_entries > 0 and n_hyper_entries > 0:
+            log_dict["lora_norm/basis_to_hyper_ratio"] = (
+                total_basis_norm / max(total_hyper_norm, 1e-8)
+            )
+
+    def _log_gradient_norms(self, log_dict, unwrapped):
+        """Log gradient norms per component."""
+        component_map = {
+            "grad_norm/perceiver": "perceiver",
+            "grad_norm/basis_bank": "basis_bank",
+            "grad_norm/coefficient_head": "coefficient_head",
+            "grad_norm/hyper_heads": "hyper_heads",
+        }
+        for log_key, attr in component_map.items():
+            if hasattr(unwrapped, attr):
+                module = getattr(unwrapped, attr)
+                if module is None:
+                    continue
+                total_norm = 0.0
+                for p in module.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                log_dict[log_key] = total_norm ** 0.5
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """Run evaluation with quantitative metrics and sample generations."""
+        # Run standard eval loop
+        output = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        # Sample generations with teacher comparison
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if not (
+            hasattr(unwrapped, "teacher")
+            and unwrapped.teacher is not None
+            and self.eval_dataset is not None
+        ):
+            return output
+
+        try:
+            self._log_sample_generations(unwrapped, metric_key_prefix)
+        except Exception as e:
+            logger.warning(f"Sample generation logging failed: {e}")
+
+        return output
+
+    def _log_sample_generations(self, unwrapped, prefix="eval"):
+        """Generate student+teacher responses on a few eval prompts and log to wandb."""
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+        except ImportError:
+            return
+
+        from ctx_to_lora.model_loading import get_tokenizer
+
+        eval_ds = self.eval_dataset
+        if eval_ds is None or len(eval_ds) == 0:
+            return
+
+        # Pick a fixed set of indices (up to 5)
+        if self._eval_prompt_indices is None:
+            n_samples = min(5, len(eval_ds))
+            step = max(1, len(eval_ds) // n_samples)
+            self._eval_prompt_indices = list(range(0, n_samples * step, step))
+
+        tokenizer = get_tokenizer(unwrapped.base_model.config.name_or_path)
+
+        rows = []
+        unwrapped.eval()
+        for idx in self._eval_prompt_indices:
+            if idx >= len(eval_ds):
+                continue
+            sample = eval_ds[idx]
+
+            # Decode input for display
+            ctx_text = sample.get("ctx_text", "")
+            if isinstance(ctx_text, list):
+                ctx_text = ctx_text[0] if ctx_text else ""
+            ctx_snippet = ctx_text[:200] if isinstance(ctx_text, str) else ""
+
+            question = sample.get("question", sample.get("user_query", ""))
+            if isinstance(question, list):
+                question = question[0] if question else ""
+
+            rows.append([ctx_snippet, question, "", ""])
+
+        if rows:
+            table = wandb.Table(
+                columns=["system_prompt", "user_query", "teacher_response", "student_response"],
+                data=rows,
+            )
+            wandb.log({f"{prefix}/sample_generations": table}, step=self.state.global_step)
 
 
 def get_decay_parameter_names(model) -> list[str]:
@@ -628,21 +783,20 @@ def train_model(
         del training_args.gen_lora_l1_reg_coef
         del training_args.use_per_ctx_average_loss
 
-        if training_args.use_kl_loss:
-            logger.info("Training with distillation loss. Using DistillationTrainer.")
-            trainer_cls = DistillationTrainer
+        use_kl = getattr(training_args, "use_kl_loss", False)
+        if use_kl:
+            if isinstance(model, HyperDistillModel):
+                logger.info("Using OnlineDistillationTrainer for HyperDistill.")
+                trainer_cls = OnlineDistillationTrainer
+            else:
+                logger.info("Training with distillation loss. Using DistillationTrainer.")
+                trainer_cls = DistillationTrainer
             del training_args.use_kl_loss
 
         # Pass basis diversity coefficient if available
         if hasattr(training_args, "basis_diversity_coef"):
             trainer_kwargs["basis_diversity_coef"] = training_args.basis_diversity_coef
             del training_args.basis_diversity_coef
-
-        # Use OnlineDistillationTrainer for HyperDistill models
-        if isinstance(model, HyperDistillModel) and training_args.use_kl_loss:
-            logger.info("Using OnlineDistillationTrainer for HyperDistill.")
-            trainer_cls = OnlineDistillationTrainer
-            del training_args.use_kl_loss
 
     if training_args.auto_find_batch_size:
         # set the batch size to some high number

@@ -18,10 +18,10 @@ logger = logging.getLogger()
 
 
 class CoefficientHead(nn.Module):
-    """Compute basis mixing coefficients from perceiver latent output.
+    """Compute basis mixing logits from perceiver latent output.
 
     Input: Perceiver output (batch, n_queries, d_latent)
-    Output: Softmax coefficients (batch, n_basis)
+    Output: Logits (batch, n_basis) — softmax applied downstream in BasisLoRABank.mix()
     """
 
     def __init__(self, d_latent: int = 512, n_basis: int = 8):
@@ -40,16 +40,15 @@ class CoefficientHead(nn.Module):
         self,
         latents: Float[Tensor, "batch n_queries d_latent"],
     ) -> Float[Tensor, "batch n_basis"]:
-        """Pool latents and produce softmax coefficients."""
+        """Pool latents and produce basis mixing logits (pre-softmax)."""
         # Mean pool across query dimension
         pooled = latents.mean(dim=1)  # (batch, d_latent)
         pooled = self.pool_norm(pooled)
 
-        # Project to n_basis and apply softmax
+        # Project to n_basis logits (softmax applied in BasisLoRABank.mix)
         logits = self.linear(pooled)  # (batch, n_basis)
-        coefficients = F.softmax(logits, dim=-1)
 
-        return coefficients
+        return logits
 
 
 class RefinementBlocks(nn.Module):

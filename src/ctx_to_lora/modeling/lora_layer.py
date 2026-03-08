@@ -180,6 +180,13 @@ def apply_per_layer_lora(
         position_ids: Position IDs for sequence packing.
     """
     layers = get_layers(model)
+
+    # Reset all patched modules to base lora_forward (without A/B bound)
+    for layer in layers:
+        for name, module in layer.named_modules():
+            if hasattr(module, '_base_lora_forward'):
+                module.forward = module._base_lora_forward
+
     if position_ids is not None:
         position_ids = position_ids.squeeze(0)
         seq_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]

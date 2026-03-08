@@ -80,12 +80,12 @@ class BasisLoRABank(nn.Module):
 
     def mix(
         self,
-        coefficients: Float[Tensor, "batch n_basis"],
+        logits: Float[Tensor, "batch n_basis"],
     ) -> dict[str, dict[str, Float[Tensor, "batch n_layers r d"]]]:
-        """Mix basis LoRAs using learned coefficients.
+        """Mix basis LoRAs using logits from CoefficientHead.
 
         Args:
-            coefficients: Softmax coefficients (batch, n_basis)
+            logits: Pre-softmax logits (batch, n_basis)
 
         Returns:
             Dict mapping virtual_module_name -> {A: (batch, n_layers, r, d_in),
@@ -95,13 +95,11 @@ class BasisLoRABank(nn.Module):
 
         for vname in self.module_specs:
             if self.per_module_routing:
-                # Per-module modulated coefficients
-                # α_module ∈ R^{n_basis}, coefficients: (batch, n_basis)
+                # Per-module modulated coefficients in logit space
                 alpha = self.module_routing[vname]  # (n_basis,)
-                modulated = coefficients * alpha.unsqueeze(0)  # (batch, n_basis)
-                c = F.softmax(modulated, dim=-1)  # (batch, n_basis)
+                c = F.softmax(logits * alpha.unsqueeze(0), dim=-1)  # (batch, n_basis)
             else:
-                c = coefficients  # (batch, n_basis)
+                c = F.softmax(logits, dim=-1)  # (batch, n_basis)
 
             # Weighted sum: c @ basis -> (batch, n_layers, r, d)
             # basis_A[vname]: (n_basis, n_layers, r, d_in)

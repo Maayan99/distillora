@@ -986,11 +986,6 @@ class MultiHeadHyperLoRA(nn.Module):
         # Create per-group heads
         for d_lora, vnames in groups.items():
             head_name = f"head_{d_lora}"
-            total_n_layers = sum(
-                config.basis_module_specs[v][0] for v in vnames
-            )
-            n_output = total_n_layers * self.rank
-
             # Per-layer EinMix projection
             self.heads[head_name] = nn.Sequential(
                 nn.LayerNorm(self.d_latent),
@@ -1010,7 +1005,7 @@ class MultiHeadHyperLoRA(nn.Module):
                     torch.ones(1, n_layers, self.rank, 1)
                 )
                 self.scaler_B[vname] = nn.Parameter(
-                    torch.zeros(1, n_layers, self.rank, 1)
+                    torch.ones(1, n_layers, self.rank, 1)
                 )
 
     def forward(
@@ -1224,12 +1219,14 @@ class HyperDistillModel(nn.Module):
 
                 module.forward_orig = module.forward
                 module.patched_forward = True
-                module.forward = partial(
+                base_forward = partial(
                     lora_forward_fn,
                     self=module,
                     lora_dropout_p=0.0,
                     scaling=self.lora_alpha,
                 )
+                module._base_lora_forward = base_forward
+                module.forward = base_forward
 
     @property
     def config(self):
@@ -1302,38 +1299,6 @@ class HyperDistillModel(nn.Module):
             )
         return ctx_features
 
-    def _aggregate(
-        self,
-        ctx_features: Float[Tensor, "batch ..."],
-        ctx_attn_mask=None,
-        ctx_position_ids=None,
-    ):
-        """Run perceiver to get latent queries."""
-        from einops import rearrange, repeat
-
-        # Handle per-layer activations: (batch, n_layers, seq_len, d) -> (n_layers*batch, seq_len, d)
-        if ctx_features.dim() == 4:
-            bs, n_layers, seq_len, d = ctx_features.shape
-            if ctx_attn_mask is not None:
-                ctx_attn_mask = repeat(
-                    ctx_attn_mask,
-                    "bs seq_len -> (n_layers bs) seq_len",
-                    n_layers=n_layers,
-                )
-            ctx_features = rearrange(
-                ctx_features,
-                "bs n_layers seq_len d -> (n_layers bs) seq_len d",
-            )
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            latents = self.perceiver(ctx_features, ctx_attn_mask, ctx_position_ids)
-
-        # Reshape back if needed: (n_layers*batch, n_queries, d) -> (batch, n_layers*n_queries, d)
-        if ctx_features.dim() == 4 or (hasattr(self, '_n_layers_ctx') and self._n_layers_ctx):
-            pass  # perceiver already handles this
-
-        return latents
-
     def generate_weights(
         self,
         ctx_ids,
@@ -1353,37 +1318,30 @@ class HyperDistillModel(nn.Module):
         ctx_features = self._encode_context(ctx_ids, ctx_attn_mask, ctx_position_ids)
 
         # 2. Handle per-layer features for perceiver
+        # Flatten layers into sequence dimension so perceiver processes all layers together
+        # Output: (bs, n_output_queries, d) — no per-layer batch expansion needed
         if ctx_features.dim() == 4:
-            bs, n_layers, seq_len, d = ctx_features.shape
-            attn_mask_for_perceiver = ctx_attn_mask
-            if attn_mask_for_perceiver is not None:
-                from einops import repeat
-                attn_mask_for_perceiver = repeat(
-                    attn_mask_for_perceiver,
-                    "bs seq_len -> (n_layers bs) seq_len",
-                    n_layers=n_layers,
-                )
+            from einops import repeat
+            bs, n_layers_ctx, seq_len, d = ctx_features.shape
             features_flat = rearrange(
                 ctx_features,
-                "bs n_layers seq_len d -> (n_layers bs) seq_len d",
+                "bs n_layers seq_len d -> bs (n_layers seq_len) d",
             )
+            attn_mask_for_perceiver = ctx_attn_mask
+            if attn_mask_for_perceiver is not None:
+                attn_mask_for_perceiver = repeat(
+                    attn_mask_for_perceiver,
+                    "bs seq_len -> bs (n_layers seq_len)",
+                    n_layers=n_layers_ctx,
+                )
         else:
             bs = ctx_features.shape[0]
             features_flat = ctx_features
             attn_mask_for_perceiver = ctx_attn_mask
 
-        # 3. Perceiver: get flat latent queries
+        # 3. Perceiver: (bs, seq, d) -> (bs, n_output_queries, d)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             flat_latents = self.perceiver(features_flat, attn_mask_for_perceiver, ctx_position_ids)
-
-        # Reshape back from (n_layers*bs, n_queries, d) to (bs, total_queries, d)
-        if ctx_features.dim() == 4:
-            flat_latents = rearrange(
-                flat_latents,
-                "(n_layers bs) n_queries d -> bs (n_layers n_queries) d",
-                n_layers=n_layers,
-                bs=bs,
-            )
 
         # 4. Coefficient head: pool latents → basis coefficients
         basis_lora_dict = None

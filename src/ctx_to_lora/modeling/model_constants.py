@@ -108,8 +108,8 @@ VIRTUAL_MODULE_SPECS = {
     "o_proj": {
         "real_name": "o_proj",
         "layer_indices": ALL_LAYER_INDICES,
-        "d_in": DN_O_PROJ[1],  # Note: o_proj input is hidden_size (after attention)
-        "d_out": DN_O_PROJ[0],
+        "d_in": DN_O_PROJ[0],
+        "d_out": DN_O_PROJ[1],
         "path_prefix": "self_attn",
     },
     # MLP projections
