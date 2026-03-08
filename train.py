@@ -280,6 +280,7 @@ def main():
             student_num_layers=student_model.config.num_hidden_layers,
             aggregator_config=agg_config,
             ctx_encoder_type=ctx_encoder_args.ctx_encoder_type,
+            lora_alpha=getattr(hypernet_args, 'lora_alpha', None),
         )
 
         # Create basis LoRA bank

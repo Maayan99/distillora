@@ -141,6 +141,7 @@ class DistillationTrainer(ModulatedModelTrainer):
         self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
         self.basis_diversity_coef = kwargs.pop("basis_diversity_coef", 0.0)
         super().__init__(*args, **kwargs)
+        self._last_logged_step = -1
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -244,10 +245,15 @@ class DistillationTrainer(ModulatedModelTrainer):
             scaler *= self.accelerator.num_processes
 
         # rough estimate of the losses (we only log the values from one step)
-        if (self.state.global_step == 1 and self.args.logging_first_step) or (
-            self.args.logging_strategy == IntervalStrategy.STEPS
-            and self.state.global_step % self.state.logging_steps == 0
-        ):
+        is_logging_step = (
+            (self.state.global_step == 1 and self.args.logging_first_step) or (
+                self.args.logging_strategy == IntervalStrategy.STEPS
+                and self.state.global_step % self.state.logging_steps == 0
+            )
+        ) and self.state.global_step != self._last_logged_step
+
+        if is_logging_step:
+            self._last_logged_step = self.state.global_step
             # compensate `num_items_in_batch` division
             log_dict = {
                 "kl_loss": loss.item() * scaler,
@@ -422,6 +428,7 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
         self._last_hyper_loras = None
         self._last_coefficients = None
         self._step_start_time = None
+        self._last_logged_step = -1
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -572,9 +579,10 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
                 self.args.logging_strategy == IntervalStrategy.STEPS
                 and self.state.global_step % self.state.logging_steps == 0
             )
-        )
+        ) and self.state.global_step != self._last_logged_step
 
         if is_logging_step:
+            self._last_logged_step = self.state.global_step
             log_dict = {
                 "loss/kl": loss.item() * scaler,
                 "loss/l1_reg": (l1_norm.item() * scaler if isinstance(l1_norm, torch.Tensor) else l1_norm * scaler),

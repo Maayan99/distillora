@@ -949,6 +949,9 @@ class HyperDistillConfig:
     # Encoder args
     ctx_encoder_type: str
 
+    # LoRA scaling
+    lora_alpha: float = None  # defaults to lora_rank in HyperDistillModel
+
 
 class MultiHeadHyperLoRA(nn.Module):
     """Multi-head hypernetwork that generates LoRAs for heterogeneous target modules.
@@ -991,6 +994,7 @@ class MultiHeadHyperLoRA(nn.Module):
                 nn.LayerNorm(self.d_latent),
                 nn.Linear(self.d_latent, d_lora),
             )
+            nn.init.zeros_(self.heads[head_name][1].bias)
 
             for vname in vnames:
                 self.head_assignments[vname] = head_name
@@ -1005,7 +1009,7 @@ class MultiHeadHyperLoRA(nn.Module):
                     torch.ones(1, n_layers, self.rank, 1)
                 )
                 self.scaler_B[vname] = nn.Parameter(
-                    torch.ones(1, n_layers, self.rank, 1)
+                    torch.zeros(1, n_layers, self.rank, 1)
                 )
 
     def forward(
@@ -1082,7 +1086,7 @@ class HyperDistillModel(nn.Module):
         self.ctx_encoder_args = ctx_encoder_args
         self.use_sequence_packing = use_sequence_packing
         self.model_accepts_loss_kwargs = True
-        self.lora_alpha = lora_alpha or config.lora_rank ** (3 / 2) * 2
+        self.lora_alpha = lora_alpha or config.lora_alpha or float(config.lora_rank)
 
         # Register base model (student, frozen)
         self.register_module("base_model", base_model)

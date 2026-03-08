@@ -24,6 +24,7 @@ n_refinement_blocks: 2
 # Hypernetwork
 latent_size: 512
 per_rank_gen: true
+lora_alpha: 8
 use_bias: true
 num_pre_head_layers: 1
 dropout_rate: 0.0
@@ -71,8 +72,9 @@ eval_steps: 500
 per_device_eval_batch_size: 64
 
 # Logging
-logging_steps: 50
+logging_steps: 10
 logging_first_step: true
+report_to: wandb
 
 # Saving
 save_strategy: steps

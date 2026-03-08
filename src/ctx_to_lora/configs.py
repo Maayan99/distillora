@@ -519,6 +519,10 @@ class HypernetArguments:
     num_pre_head_layers: int = field(
         default=1, metadata={"help": "# of layers before hypernet head"}
     )
+    lora_alpha: float | None = field(
+        default=None,
+        metadata={"help": "LoRA scaling factor. Defaults to lora_rank if not set."},
+    )
 
 
 @dataclass
