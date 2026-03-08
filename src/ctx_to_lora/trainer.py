@@ -430,6 +430,7 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
         self._last_coefficients = None
         self._step_start_time = None
         self._last_logged_step = -1
+        self._last_grad_logged_step = -1
         self._loss_window = {
             "kl": deque(maxlen=10),
             "l1_reg": deque(maxlen=10),
@@ -613,9 +614,6 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             for key, window in self._loss_window.items():
                 log_dict[f"loss_avg10/{key}"] = sum(window) / len(window)
 
-            # Gradient norms
-            self._log_gradient_norms(log_dict, unwrapped)
-
             # Learning rate
             if self.lr_scheduler is not None:
                 log_dict["lr/current"] = self.lr_scheduler.get_last_lr()[0]
@@ -623,6 +621,28 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             self.log(log_dict)
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override to log gradient norms after backward."""
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        is_logging_step = (
+            (self.state.global_step == 1 and self.args.logging_first_step)
+            or (
+                self.args.logging_strategy == IntervalStrategy.STEPS
+                and self.state.global_step % self.state.logging_steps == 0
+            )
+        ) and self.state.global_step != self._last_grad_logged_step
+
+        if is_logging_step:
+            self._last_grad_logged_step = self.state.global_step
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            grad_dict = {}
+            self._log_gradient_norms(grad_dict, unwrapped)
+            if grad_dict:
+                self.log(grad_dict)
+
+        return loss
 
     def _log_lora_norms(self, log_dict, gen_loras, unwrapped):
         """Log Frobenius norms of basis and hyper LoRAs."""

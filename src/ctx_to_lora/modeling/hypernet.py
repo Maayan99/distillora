@@ -1009,7 +1009,7 @@ class MultiHeadHyperLoRA(nn.Module):
                     torch.ones(1, n_layers, self.rank, 1)
                 )
                 self.scaler_B[vname] = nn.Parameter(
-                    torch.zeros(1, n_layers, self.rank, 1)
+                    torch.full((1, n_layers, self.rank, 1), 0.01)
                 )
 
     def forward(

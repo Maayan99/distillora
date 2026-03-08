@@ -52,9 +52,15 @@ class BasisLoRABank(nn.Module):
             self.basis_A[vname] = nn.Parameter(
                 torch.empty(n_basis, n_layers, rank, d_in)
             )
-            # B matrices: (n_basis, n_layers, r, d_out) — initialized to zero
+            # B matrices: (n_basis, n_layers, r, d_out) — small random init
+            # to break symmetry so each basis gets differentiated gradients
             self.basis_B[vname] = nn.Parameter(
-                torch.zeros(n_basis, n_layers, rank, d_out)
+                torch.empty(n_basis, n_layers, rank, d_out)
+            )
+            nn.init.normal_(
+                self.basis_B[vname],
+                mean=0,
+                std=0.01 / sqrt(d_out * rank),
             )
 
             # Initialize A ~ N(0, 0.2 / sqrt(d_in * r))

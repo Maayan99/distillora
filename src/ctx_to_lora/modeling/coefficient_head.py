@@ -34,7 +34,7 @@ class CoefficientHead(nn.Module):
 
         # Initialize to produce near-uniform coefficients at start
         nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        nn.init.normal_(self.linear.bias, mean=0, std=0.01)
 
     def forward(
         self,
