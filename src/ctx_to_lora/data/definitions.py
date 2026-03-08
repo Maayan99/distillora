@@ -20,6 +20,17 @@ CTX_AFFIXES = {
         # `<|im_end|>\n<|im_start|>assistant\n`
         "suffix": [151645, 198, 151644, 77091, 198],
     },
+    # Qwen3.5 models share the same tokenizer
+    "Qwen/Qwen3.5-0.8B": {
+        # `<|im_start|>system\n<|im_end|>\n<|im_start|>user\n`
+        "prefix": [151644, 8948, 198, 151645, 198, 151644, 872, 198],
+        # `<|im_end|>\n<|im_start|>assistant\n`
+        "suffix": [151645, 198, 151644, 77091, 198],
+    },
+    "Qwen/Qwen3.5-4B": {
+        "prefix": [151644, 8948, 198, 151645, 198, 151644, 872, 198],
+        "suffix": [151645, 198, 151644, 77091, 198],
+    },
 }
 
 
@@ -36,6 +47,23 @@ LONGBENCH_E_TASKS = [
 ]
 
 DS_KWARGS = {
+    "system_prompts": dict(
+        train=dict(
+            path="json",
+            data_files="data/splits/train.jsonl",
+            split="train",
+        ),
+        validation=dict(
+            path="json",
+            data_files="data/splits/eval.jsonl",
+            split="train",
+        ),
+        test=dict(
+            path="json",
+            data_files="data/splits/test.jsonl",
+            split="train",
+        ),
+    ),
     "pwc": dict(
         train=dict(path="sggetao/PwC", split="train"),
         validation=dict(path="sggetao/PwC", split="test[:900]"),

@@ -17,6 +17,7 @@ from transformers import (
 from ctx_to_lora.configs import (
     AggregatorArguments,
     ArgumentParser,
+    BasisLoRAArguments,
     CtxEncoderArguments,
     CtxTrainingArguments,
     DataArguments,
@@ -24,6 +25,7 @@ from ctx_to_lora.configs import (
     HypernetArguments,
     LoRAArguments,
     ModelArguments,
+    TeacherArguments,
     TrainingArguments,
 )
 from ctx_to_lora.data.collator import (  # train_packed_collator,; DefaultDataCollator,
@@ -44,6 +46,8 @@ from ctx_to_lora.model_loading import (
     get_tokenizer,
 )
 from ctx_to_lora.modeling.hypernet import (
+    HyperDistillConfig,
+    HyperDistillModel,
     ModulatedPretrainedModel,
     get_hypernet_config,
 )
@@ -75,6 +79,8 @@ def main():
             HypernetArguments,
             AggregatorArguments,
             CtxEncoderArguments,
+            BasisLoRAArguments,
+            TeacherArguments,
         )
     )
     (
@@ -86,6 +92,8 @@ def main():
         hypernet_args,
         aggregator_args,
         ctx_encoder_args,
+        basis_lora_args,
+        teacher_args,
     ) = parser.parse()
 
     # there shouldn't be overlap between args
@@ -99,6 +107,8 @@ def main():
             hypernet_args,
             aggregator_args,
             ctx_encoder_args,
+            basis_lora_args,
+            teacher_args,
         ]
     )
 
@@ -147,6 +157,8 @@ def main():
         **vars(deepcopy(hypernet_args)),
         **vars(deepcopy(aggregator_args)),
         **vars(deepcopy(ctx_encoder_args)),
+        **vars(deepcopy(basis_lora_args)),
+        **vars(deepcopy(teacher_args)),
     }
     args["deepspeed_plugin"] = None
     logger.debug(f"args: {args}")
@@ -176,7 +188,135 @@ def main():
             ctx_encoder_model_config = base_model.config
             ctx_tokenizer = tokenizer
 
-    if ctx_args.exp_setup == ExperimentSetup.HYPERLORA:
+    # Check if this is a HyperDistill run (has teacher config)
+    use_hyperdistill = teacher_args.teacher_model_name_or_path is not None
+
+    if use_hyperdistill:
+        logger.info("Using HyperDistill (cross-model distillation)")
+        from ctx_to_lora.model_loading import load_plain_model
+        from ctx_to_lora.modeling.basis_lora import BasisLoRABank
+        from ctx_to_lora.modeling.model_constants import (
+            get_basis_module_specs,
+            VIRTUAL_MODULE_SPECS,
+        )
+        from ctx_to_lora.modeling.teacher import load_teacher
+        from ctx_to_lora.modeling.aggregator import AggregatorConfig, get_aggregator_config
+
+        model_name = model_args.model_name_or_path
+        tokenizer = get_tokenizer(model_name, train=True)
+
+        # Load student model (plain, no PEFT)
+        student_model = load_plain_model(
+            model_name,
+            use_flash_attn=model_args.use_flash_attn,
+            train=True,
+        )
+        student_model.config.pad_token_id = tokenizer.pad_token_id
+
+        ctx_name = ctx_encoder_args.ctx_encoder_model_name_or_path
+        if ctx_name is None:
+            ctx_name = model_name
+        ctx_tokenizer = get_tokenizer(ctx_name, train=True)
+        ctx_encoder_model_config = AutoConfig.from_pretrained(
+            ctx_name, trust_remote_code=True
+        )
+
+        # Set ctx_encoder_last_layer
+        if ctx_encoder_args.ctx_encoder_last_layer is None:
+            ctx_encoder_args.ctx_encoder_last_layer = student_model.config.num_hidden_layers
+
+        # Get basis module specs
+        target_modules = lora_args.target_modules or ["down_proj"]
+        # For basis: all projections the student has
+        all_basis_targets = list(target_modules) + [
+            m for m in ["k_proj", "o_proj", "gate_proj", "up_proj"]
+            if m not in target_modules
+        ]
+        basis_module_specs = get_basis_module_specs(all_basis_targets)
+
+        # Hyper-generated targets (subset)
+        hyper_target_vnames = []
+        for vname, vspec in VIRTUAL_MODULE_SPECS.items():
+            if vspec["real_name"] in target_modules:
+                hyper_target_vnames.append(vname)
+
+        # Build aggregator config
+        agg_config = AggregatorConfig(
+            aggregator_type=aggregator_args.aggregator_type,
+            num_layers=student_model.config.num_hidden_layers,
+            num_modules=len(target_modules),
+            num_extra_modules=0,
+            output_size=hypernet_args.latent_size,
+            feature_size=ctx_encoder_model_config.hidden_size,
+            pooling_type=aggregator_args.pooling_type,
+            num_latent_factor=aggregator_args.num_latent_factor,
+            lora_r=lora_args.lora_r,
+            per_rank_gen=hypernet_args.per_rank_gen,
+            n_latent_queries=aggregator_args.n_latent_queries,
+            num_blocks=aggregator_args.num_blocks,
+            num_self_attn_per_block=aggregator_args.num_self_attn_per_block,
+            shared_weights=aggregator_args.shared_weights,
+            layer_to_layer_ctx_encoder=(
+                ctx_encoder_args.ctx_encoder_type == "per_layer_activations"
+            ),
+        )
+
+        # Build HyperDistill config
+        hyperdistill_config = HyperDistillConfig(
+            latent_size=hypernet_args.latent_size,
+            lora_rank=lora_args.lora_r,
+            n_basis=basis_lora_args.n_basis,
+            basis_rank=basis_lora_args.basis_rank,
+            per_module_routing=basis_lora_args.per_module_routing,
+            n_refinement_blocks=basis_lora_args.n_refinement_blocks,
+            basis_module_specs=basis_module_specs,
+            hyper_target_modules=hyper_target_vnames,
+            basis_target_modules=list(basis_module_specs.keys()),
+            student_hidden_size=student_model.config.hidden_size,
+            student_num_layers=student_model.config.num_hidden_layers,
+            aggregator_config=agg_config,
+            ctx_encoder_type=ctx_encoder_args.ctx_encoder_type,
+        )
+
+        # Create basis LoRA bank
+        basis_bank = BasisLoRABank(
+            n_basis=basis_lora_args.n_basis,
+            rank=basis_lora_args.basis_rank,
+            module_specs=basis_module_specs,
+            per_module_routing=basis_lora_args.per_module_routing,
+        )
+
+        # Load teacher
+        teacher = load_teacher(
+            teacher_args.teacher_model_name_or_path,
+            top_k=teacher_args.teacher_top_k,
+            max_new_tokens=teacher_args.teacher_max_new_tokens,
+        )
+
+        # Create HyperDistill model
+        model = HyperDistillModel(
+            base_model=student_model,
+            config=hyperdistill_config,
+            ctx_encoder_args=ctx_encoder_args,
+            teacher=teacher,
+            basis_lora_bank=basis_bank,
+            use_sequence_packing=ctx_args.use_sequence_packing,
+        )
+
+        training_args.gen_lora_l1_reg_coef = ctx_args.gen_lora_l1_reg_coef
+        training_args.use_kl_loss = ctx_args.use_kl_loss
+        training_args.use_per_ctx_average_loss = ctx_args.use_per_ctx_average_loss
+        training_args.basis_diversity_coef = basis_lora_args.basis_diversity_coef
+
+        # Verify frozen components
+        if len([p for p in model.ctx_encoder.parameters() if p.requires_grad]):
+            raise ValueError("ctx_encoder contains trainable parameters")
+        if len([p for p in model.base_model.parameters() if p.requires_grad]):
+            raise ValueError("base model contains trainable parameters")
+        if len([p for p in model.teacher.parameters() if p.requires_grad]):
+            raise ValueError("teacher model contains trainable parameters")
+
+    elif ctx_args.exp_setup == ExperimentSetup.HYPERLORA:
         logger.info("Using HyperLoRA")
         if not ctx_args.from_pretrained_checkpoint:
             hypernet_config = get_hypernet_config(
@@ -258,7 +398,7 @@ def main():
     ############ Dataset setup
     logger.info("Loading dataset...")
 
-    add_ctx_to_chat = not isinstance(model, ModulatedPretrainedModel)
+    add_ctx_to_chat = not isinstance(model, (ModulatedPretrainedModel, HyperDistillModel))
     ctx_model_max_len = model.ctx_encoder.config.max_position_embeddings
     if ctx_args.max_ctx_len > 0:
         ctx_model_max_len = ctx_args.max_ctx_len
@@ -355,7 +495,7 @@ def main():
 
     collator = flatten_if_not_packed
 
-    if isinstance(model, ModulatedPretrainedModel):
+    if isinstance(model, (ModulatedPretrainedModel, HyperDistillModel)):
         if isinstance(model.base_model, PeftModel):
             base_model = model.base_model.base_model
         else:

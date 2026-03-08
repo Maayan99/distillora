@@ -164,6 +164,28 @@ def get_model(
     return model
 
 
+def load_plain_model(
+    model_name_or_path: str,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    use_flash_attn: bool = True,
+    train: bool = True,
+):
+    """Load a model without PEFT wrapping, for direct LoRA monkey-patching."""
+    attn_impl = "flash_attention_2" if use_flash_attn else "eager"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        device_map=device,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        attn_implementation=attn_impl,
+    )
+    model.train(train)
+    for param in model.named_parameters():
+        param[1].requires_grad = False
+    return model
+
+
 def get_lora_config(model_dir, **kwargs):
     if "target_modules" not in kwargs or kwargs["target_modules"] is None:
         logger.info("No target modules specified for LoRA.")

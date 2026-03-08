@@ -981,10 +981,20 @@ def detokenize_ctx_text(
 def tokenize_ctx_text(
     samples: dict[str, Any],
     tokenizer: PreTrainedTokenizerBase,
+    as_system_message: bool = False,
 ) -> dict[str, Any]:
     if tokenizer.chat_template:
-        tokenized_text = tokenizer.apply_chat_template(
-            [
+        if as_system_message:
+            # Tokenize context as a system message only
+            # Used for HyperDistill where the context IS the system prompt
+            messages_list = [
+                [{"role": "system", "content": ctx.strip()}]
+                if isinstance(ctx, str)
+                else ctx
+                for ctx in samples["context"]
+            ]
+        else:
+            messages_list = [
                 [
                     {"role": "system", "content": ""},
                     {"role": "user", "content": ctx.strip()},
@@ -992,7 +1002,9 @@ def tokenize_ctx_text(
                 if isinstance(ctx, str)
                 else ctx
                 for ctx in samples["context"]
-            ],
+            ]
+        tokenized_text = tokenizer.apply_chat_template(
+            messages_list,
             tokenize=True,
             add_generation_prompt=True,
             return_attention_mask=False,

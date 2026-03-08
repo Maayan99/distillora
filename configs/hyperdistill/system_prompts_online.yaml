@@ -1,0 +1,86 @@
+# HyperDistill: Cross-model distillation with basis LoRA + hypernetwork
+# Teacher: Qwen3.5-4B -> Student: Qwen3.5-0.8B
+
+# Model
+model_name_or_path: Qwen/Qwen3.5-0.8B
+
+# Teacher
+teacher_model_name_or_path: Qwen/Qwen3.5-4B
+teacher_top_k: 16
+teacher_max_new_tokens: 256
+
+# LoRA (hypernetwork-generated targets)
+lora_r: 8
+lora_dropout: 0.0
+target_modules: [down_proj, q_proj, v_proj]
+
+# Basis LoRA
+n_basis: 8
+basis_rank: 8
+basis_diversity_coef: 0.01
+per_module_routing: true
+n_refinement_blocks: 2
+
+# Hypernetwork
+latent_size: 512
+per_rank_gen: true
+use_bias: true
+num_pre_head_layers: 1
+dropout_rate: 0.0
+
+# Context encoder
+ctx_encoder_type: per_layer_activations
+
+# Aggregator (Perceiver)
+aggregator_type: perceiver
+n_latent_queries: 16
+num_blocks: 6
+num_self_attn_per_block: 0
+shared_weights: false
+
+# Training
+use_kl_loss: true
+use_per_ctx_average_loss: false
+gen_lora_l1_reg_coef: 0.001
+use_sequence_packing: true
+
+# Optimizer
+learning_rate: 4.0e-5
+weight_decay: 0.01
+warmup_steps: 200
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr: 1.0e-7
+
+# Training schedule
+num_train_epochs: 3
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+bf16: true
+tf32: true
+
+# Packing
+max_packed_inp_len: 4096
+max_packed_ctx_len: 4096
+max_qas_len: 2048
+max_ctx_chunk_len: 2048
+
+# Eval
+eval_strategy: steps
+eval_steps: 500
+per_device_eval_batch_size: 64
+
+# Logging
+logging_steps: 50
+logging_first_step: true
+
+# Saving
+save_strategy: steps
+save_steps: 1000
+save_total_limit: 3
+
+# Data
+train_ds_names:
+  - system_prompts
+val_ds_names:
+  - system_prompts

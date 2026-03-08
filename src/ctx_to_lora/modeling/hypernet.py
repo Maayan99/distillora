@@ -28,8 +28,10 @@ from transformers.models.modernbert.modeling_modernbert import ModernBertModel
 
 from ctx_to_lora.configs import (
     AggregatorArguments,
+    BasisLoRAArguments,
     CtxEncoderArguments,
     HypernetArguments,
+    TeacherArguments,
 )
 from ctx_to_lora.data.processing import tokenize_ctx_text
 from ctx_to_lora.model_loading import (
@@ -44,6 +46,8 @@ from ctx_to_lora.modeling.aggregator import (
 from ctx_to_lora.modeling.ctx_encoder import CTX_ENCODER_CLS, CTX_ENCODER_TYPE
 from ctx_to_lora.modeling.lora_layer import (
     apply_lora_to_layers,
+    apply_dual_lora_to_layers,
+    apply_per_layer_lora,
     lora_forward,
     lora_forward_packed,
 )
@@ -915,6 +919,634 @@ class ModulatedPretrainedModel(nn.Module):
         return model_outputs
 
 
+@dataclass
+class HyperDistillConfig:
+    """Configuration for HyperDistill model."""
+    latent_size: int
+    lora_rank: int
+
+    # Basis LoRA
+    n_basis: int
+    basis_rank: int
+    per_module_routing: bool
+    n_refinement_blocks: int
+
+    # Module specs: dict mapping virtual_name -> (n_layers, d_in, d_out)
+    basis_module_specs: dict
+
+    # Hyper-generated targets (subset of basis targets)
+    hyper_target_modules: list[str]
+    # All basis target modules (virtual names)
+    basis_target_modules: list[str]
+
+    # Student model info
+    student_hidden_size: int
+    student_num_layers: int
+
+    # Aggregator config
+    aggregator_config: AggregatorConfig
+
+    # Encoder args
+    ctx_encoder_type: str
+
+
+class MultiHeadHyperLoRA(nn.Module):
+    """Multi-head hypernetwork that generates LoRAs for heterogeneous target modules.
+
+    Instead of a single EinMix head, uses multiple heads for different module groups,
+    supporting different output dimensions per head.
+    """
+
+    def __init__(
+        self,
+        config: HyperDistillConfig,
+    ):
+        super().__init__()
+        self.config = config
+        self.d_latent = config.latent_size
+        self.rank = config.lora_rank
+
+        # Group hyper-generated targets by output dimension
+        self.heads = nn.ModuleDict()
+        self.head_assignments = {}  # virtual_name -> head_name
+
+        # Compute d_lora for each target
+        module_d_loras = {}
+        for vname in config.hyper_target_modules:
+            if vname in config.basis_module_specs:
+                n_layers, d_in, d_out = config.basis_module_specs[vname]
+                module_d_loras[vname] = d_in + d_out
+
+        # Group modules by d_lora for shared heads
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for vname, d_lora in module_d_loras.items():
+            groups[d_lora].append(vname)
+
+        # Create per-group heads
+        for d_lora, vnames in groups.items():
+            head_name = f"head_{d_lora}"
+            total_n_layers = sum(
+                config.basis_module_specs[v][0] for v in vnames
+            )
+            n_output = total_n_layers * self.rank
+
+            # Per-layer EinMix projection
+            self.heads[head_name] = nn.Sequential(
+                nn.LayerNorm(self.d_latent),
+                nn.Linear(self.d_latent, d_lora),
+            )
+
+            for vname in vnames:
+                self.head_assignments[vname] = head_name
+
+        # Per-module scalers (learned)
+        self.scaler_A = nn.ParameterDict()
+        self.scaler_B = nn.ParameterDict()
+        for vname in config.hyper_target_modules:
+            if vname in config.basis_module_specs:
+                n_layers = config.basis_module_specs[vname][0]
+                self.scaler_A[vname] = nn.Parameter(
+                    torch.ones(1, n_layers, self.rank, 1)
+                )
+                self.scaler_B[vname] = nn.Parameter(
+                    torch.zeros(1, n_layers, self.rank, 1)
+                )
+
+    def forward(
+        self,
+        latent_queries: dict[str, Float[Tensor, "batch n_layers rank d_latent"]],
+    ) -> dict[str, dict[str, Float[Tensor, "batch n_layers rank d"]]]:
+        """Generate LoRA A/B matrices from latent queries.
+
+        Args:
+            latent_queries: Dict mapping virtual_name -> (batch, n_layers, rank, d_latent)
+
+        Returns:
+            Dict mapping virtual_name -> {A: (batch, n_layers, rank, d_in),
+                                           B: (batch, n_layers, rank, d_out)}
+        """
+        lora_dict = {}
+
+        for vname, queries in latent_queries.items():
+            if vname not in self.head_assignments:
+                continue
+
+            head_name = self.head_assignments[vname]
+            head = self.heads[head_name]
+
+            # queries: (batch, n_layers, rank, d_latent)
+            # Normalize before head
+            norm = torch.norm(queries, dim=-1, keepdim=True)
+            norm_queries = queries / (norm + 1e-8)
+
+            # Project: (batch, n_layers, rank, d_lora)
+            flat_lora = head(norm_queries)
+
+            # Split into A and B
+            n_layers, d_in, d_out = self.config.basis_module_specs[vname]
+            A = flat_lora[..., :d_in]
+            B = flat_lora[..., d_in:d_in + d_out]
+
+            # Apply per-module scalers
+            A = torch.einsum("ijkl,ijkl->ijkl", A, self.scaler_A[vname])
+            B = torch.einsum("ijkl,ijkl->ijkl", B, self.scaler_B[vname])
+
+            lora_dict[vname] = {"A": A, "B": B}
+
+        return lora_dict
+
+
+class HyperDistillModel(nn.Module):
+    """HyperDistill: Basis LoRA + Hypernetwork for cross-model distillation.
+
+    Combines:
+    1. Context encoder (frozen student model) for per-layer activations
+    2. Perceiver aggregator → latent queries
+    3. Coefficient head → basis mixing coefficients
+    4. Basis LoRA bank → mixed basis LoRAs
+    5. Refinement blocks → refined latent queries
+    6. Multi-head LoRA generation → hyper-generated LoRAs
+    7. Combined (basis + hyper) LoRA application to student
+    8. Online teacher for distillation targets
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,  # Student model (plain, no PEFT)
+        config: HyperDistillConfig,
+        ctx_encoder_args: CtxEncoderArguments,
+        teacher: nn.Module | None = None,
+        basis_lora_bank: nn.Module | None = None,
+        use_sequence_packing: bool = True,
+        lora_alpha: float = None,
+    ):
+        super().__init__()
+        self.device = next(base_model.parameters()).device
+        self.hyperdistill_config = config
+        self.ctx_encoder_args = ctx_encoder_args
+        self.use_sequence_packing = use_sequence_packing
+        self.model_accepts_loss_kwargs = True
+        self.lora_alpha = lora_alpha or config.lora_rank ** (3 / 2) * 2
+
+        # Register base model (student, frozen)
+        self.register_module("base_model", base_model)
+
+        # Teacher (frozen, for online distillation)
+        if teacher is not None:
+            self.register_module("teacher", teacher)
+        else:
+            self.teacher = None
+
+        # Basis LoRA bank
+        if basis_lora_bank is not None:
+            self.register_module("basis_bank", basis_lora_bank)
+        else:
+            self.basis_bank = None
+
+        self._init_model()
+
+    @property
+    def vocab_size(self):
+        return self.base_model.config.vocab_size
+
+    def get_input_embeddings(self):
+        return self.base_model.get_input_embeddings()
+
+    @property
+    def generation_config(self):
+        return self.base_model.generation_config
+
+    def _init_model(self):
+        """Initialize context encoder, perceiver, coefficient head, and hyper heads."""
+        from ctx_to_lora.modeling.coefficient_head import (
+            CoefficientHead,
+            RefinementBlocks,
+        )
+
+        config = self.hyperdistill_config
+
+        # Context encoder (frozen copy of student)
+        ctx_model_name = self.ctx_encoder_args.ctx_encoder_model_name_or_path
+        if ctx_model_name is None:
+            ctx_model_name = self.base_model.config.name_or_path
+
+        base_model_attn_impl = self.base_model.config._attn_implementation
+        encoder_model = get_model(
+            ctx_model_name,
+            train=self.base_model.training,
+            requires_grad=False,
+            use_flash_attn=base_model_attn_impl == "flash_attention_2",
+        )
+        self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](
+            encoder_model, self.ctx_encoder_args
+        )
+
+        # Perceiver aggregator
+        # Total output queries = sum over hyper targets of (n_layers * rank)
+        n_output_queries = sum(
+            config.basis_module_specs[v][0] * config.lora_rank
+            for v in config.hyper_target_modules
+            if v in config.basis_module_specs
+        )
+
+        from ctx_to_lora.modeling.idefics2 import Idefics2Perceiver, Idefics2PerceiverConfig
+
+        feature_size = self.ctx_encoder.config.hidden_size
+        encoder_config = Idefics2PerceiverConfig(
+            input_size=feature_size,
+            num_blocks=config.aggregator_config.num_blocks,
+            num_self_attn_per_block=config.aggregator_config.num_self_attn_per_block,
+            shared_weights=config.aggregator_config.shared_weights,
+            n_latents=config.aggregator_config.n_latent_queries,
+            intermediate_size_factor=4,
+            hidden_size=config.latent_size,
+            attn_implementation="flash_attention_2",
+        )
+        decoder_config = Idefics2PerceiverConfig(
+            input_size=config.latent_size,
+            num_blocks=1,
+            num_self_attn_per_block=0,
+            shared_weights=False,
+            n_latents=n_output_queries,
+            intermediate_size_factor=4,
+            hidden_size=config.latent_size,
+            attn_implementation="flash_attention_2",
+        )
+        self.perceiver = Idefics2Perceiver(encoder_config, decoder_config)
+
+        # Coefficient head (for basis mixing)
+        if self.basis_bank is not None:
+            self.coefficient_head = CoefficientHead(
+                d_latent=config.latent_size,
+                n_basis=config.n_basis,
+            )
+            self.refinement_blocks = RefinementBlocks(
+                d_latent=config.latent_size,
+                n_basis=config.n_basis,
+                n_blocks=config.n_refinement_blocks,
+            )
+
+        # Multi-head LoRA generation
+        self.hyper_heads = MultiHeadHyperLoRA(config)
+
+        # Patch base model with LoRA forwards
+        self._patch_lora_forward()
+
+    def _patch_lora_forward(self):
+        """Monkey-patch student model layers with LoRA forward passes."""
+        from ctx_to_lora.modeling.model_constants import VIRTUAL_MODULE_SPECS
+
+        layers = get_layers(self.base_model)
+
+        lora_forward_fn = (
+            lora_forward_packed if self.use_sequence_packing else lora_forward
+        )
+
+        # Collect all real module names that need patching
+        all_real_modules = set()
+        for vname in list(self.hyperdistill_config.basis_module_specs.keys()):
+            if vname in VIRTUAL_MODULE_SPECS:
+                spec = VIRTUAL_MODULE_SPECS[vname]
+                all_real_modules.add(
+                    f"{spec['path_prefix']}.{spec['real_name']}"
+                )
+
+        for layer_idx in range(len(layers)):
+            layer = layers[layer_idx]
+            for name, module in layer.named_modules():
+                if not isinstance(module, nn.Linear):
+                    continue
+                if name not in all_real_modules:
+                    continue
+                if getattr(module, "patched_forward", False):
+                    continue
+
+                module.forward_orig = module.forward
+                module.patched_forward = True
+                module.forward = partial(
+                    lora_forward_fn,
+                    self=module,
+                    lora_dropout_p=0.0,
+                    scaling=self.lora_alpha,
+                )
+
+    @property
+    def config(self):
+        return self.base_model.config
+
+    def state_dict(self, *args, **kwargs):
+        """Save only trainable components (not frozen base model / teacher / ctx encoder)."""
+        state = {}
+
+        # Save perceiver
+        for k, v in self.perceiver.state_dict(*args, **kwargs).items():
+            state[f"perceiver.{k}"] = v
+
+        # Save hyper heads
+        for k, v in self.hyper_heads.state_dict(*args, **kwargs).items():
+            state[f"hyper_heads.{k}"] = v
+
+        # Save basis bank
+        if self.basis_bank is not None:
+            for k, v in self.basis_bank.state_dict(*args, **kwargs).items():
+                state[f"basis_bank.{k}"] = v
+
+        # Save coefficient head and refinement
+        if hasattr(self, "coefficient_head"):
+            for k, v in self.coefficient_head.state_dict(*args, **kwargs).items():
+                state[f"coefficient_head.{k}"] = v
+            for k, v in self.refinement_blocks.state_dict(*args, **kwargs).items():
+                state[f"refinement_blocks.{k}"] = v
+
+        # Save metadata
+        state["config"] = self.hyperdistill_config
+        state["ctx_encoder_args"] = self.ctx_encoder_args
+        state["base_model_name_or_path"] = self.base_model.config.name_or_path
+
+        return state
+
+    def load_state_dict(self, state_dict: dict, *args, **kwargs):
+        config = state_dict.pop("config")
+        ctx_encoder_args = state_dict.pop("ctx_encoder_args")
+        base_model_name = state_dict.pop("base_model_name_or_path")
+
+        # Load component state dicts
+        perceiver_sd = {k.replace("perceiver.", ""): v for k, v in state_dict.items() if k.startswith("perceiver.")}
+        hyper_heads_sd = {k.replace("hyper_heads.", ""): v for k, v in state_dict.items() if k.startswith("hyper_heads.")}
+        basis_sd = {k.replace("basis_bank.", ""): v for k, v in state_dict.items() if k.startswith("basis_bank.")}
+        coeff_sd = {k.replace("coefficient_head.", ""): v for k, v in state_dict.items() if k.startswith("coefficient_head.")}
+        refine_sd = {k.replace("refinement_blocks.", ""): v for k, v in state_dict.items() if k.startswith("refinement_blocks.")}
+
+        self.perceiver.load_state_dict(perceiver_sd, strict=True)
+        self.hyper_heads.load_state_dict(hyper_heads_sd, strict=True)
+        if self.basis_bank is not None and basis_sd:
+            self.basis_bank.load_state_dict(basis_sd, strict=True)
+        if hasattr(self, "coefficient_head") and coeff_sd:
+            self.coefficient_head.load_state_dict(coeff_sd, strict=True)
+        if hasattr(self, "refinement_blocks") and refine_sd:
+            self.refinement_blocks.load_state_dict(refine_sd, strict=True)
+
+    def _encode_context(
+        self,
+        ctx_ids: Integer[Tensor, "n_ctx ctx_len"],
+        ctx_attn_mask: Integer[Tensor, "n_ctx ctx_len"] | None = None,
+        ctx_position_ids: Integer[Tensor, "n_ctx ctx_len"] | None = None,
+    ):
+        """Encode system prompt through frozen context encoder."""
+        with torch.no_grad():
+            ctx_features = self.ctx_encoder(
+                input_ids=ctx_ids,
+                attention_mask=ctx_attn_mask,
+                position_ids=ctx_position_ids,
+            )
+        return ctx_features
+
+    def _aggregate(
+        self,
+        ctx_features: Float[Tensor, "batch ..."],
+        ctx_attn_mask=None,
+        ctx_position_ids=None,
+    ):
+        """Run perceiver to get latent queries."""
+        from einops import rearrange, repeat
+
+        # Handle per-layer activations: (batch, n_layers, seq_len, d) -> (n_layers*batch, seq_len, d)
+        if ctx_features.dim() == 4:
+            bs, n_layers, seq_len, d = ctx_features.shape
+            if ctx_attn_mask is not None:
+                ctx_attn_mask = repeat(
+                    ctx_attn_mask,
+                    "bs seq_len -> (n_layers bs) seq_len",
+                    n_layers=n_layers,
+                )
+            ctx_features = rearrange(
+                ctx_features,
+                "bs n_layers seq_len d -> (n_layers bs) seq_len d",
+            )
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            latents = self.perceiver(ctx_features, ctx_attn_mask, ctx_position_ids)
+
+        # Reshape back if needed: (n_layers*batch, n_queries, d) -> (batch, n_layers*n_queries, d)
+        if ctx_features.dim() == 4 or (hasattr(self, '_n_layers_ctx') and self._n_layers_ctx):
+            pass  # perceiver already handles this
+
+        return latents
+
+    def generate_weights(
+        self,
+        ctx_ids,
+        ctx_attn_mask=None,
+        ctx_position_ids=None,
+    ):
+        """Full weight generation pipeline.
+
+        Returns:
+            (combined_lora_dict, basis_coefficients)
+            where combined_lora_dict maps virtual_name -> {A, B}
+        """
+        from ctx_to_lora.modeling.model_constants import VIRTUAL_MODULE_SPECS
+        from einops import rearrange
+
+        # 1. Encode context
+        ctx_features = self._encode_context(ctx_ids, ctx_attn_mask, ctx_position_ids)
+
+        # 2. Handle per-layer features for perceiver
+        if ctx_features.dim() == 4:
+            bs, n_layers, seq_len, d = ctx_features.shape
+            attn_mask_for_perceiver = ctx_attn_mask
+            if attn_mask_for_perceiver is not None:
+                from einops import repeat
+                attn_mask_for_perceiver = repeat(
+                    attn_mask_for_perceiver,
+                    "bs seq_len -> (n_layers bs) seq_len",
+                    n_layers=n_layers,
+                )
+            features_flat = rearrange(
+                ctx_features,
+                "bs n_layers seq_len d -> (n_layers bs) seq_len d",
+            )
+        else:
+            bs = ctx_features.shape[0]
+            features_flat = ctx_features
+            attn_mask_for_perceiver = ctx_attn_mask
+
+        # 3. Perceiver: get flat latent queries
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            flat_latents = self.perceiver(features_flat, attn_mask_for_perceiver, ctx_position_ids)
+
+        # Reshape back from (n_layers*bs, n_queries, d) to (bs, total_queries, d)
+        if ctx_features.dim() == 4:
+            flat_latents = rearrange(
+                flat_latents,
+                "(n_layers bs) n_queries d -> bs (n_layers n_queries) d",
+                n_layers=n_layers,
+                bs=bs,
+            )
+
+        # 4. Coefficient head: pool latents → basis coefficients
+        basis_lora_dict = None
+        coefficients = None
+        if self.basis_bank is not None:
+            coefficients = self.coefficient_head(flat_latents)
+
+            # 5. Basis mixing
+            basis_lora_dict = self.basis_bank.mix(coefficients)
+
+            # 6. Refinement: inject coefficients into latents
+            flat_latents = self.refinement_blocks(flat_latents, coefficients)
+
+        # 7. Split flat latents into per-module queries
+        hconfig = self.hyperdistill_config
+        latent_queries = {}
+        offset = 0
+        for vname in hconfig.hyper_target_modules:
+            if vname not in hconfig.basis_module_specs:
+                continue
+            n_layers = hconfig.basis_module_specs[vname][0]
+            n_queries = n_layers * hconfig.lora_rank
+            queries = flat_latents[:, offset:offset + n_queries]
+            queries = queries.view(bs, n_layers, hconfig.lora_rank, hconfig.latent_size)
+            latent_queries[vname] = queries
+            offset += n_queries
+
+        # 8. Multi-head LoRA generation
+        hyper_lora_dict = self.hyper_heads(latent_queries)
+
+        return basis_lora_dict, hyper_lora_dict, coefficients
+
+    def _build_real_lora_dict(
+        self,
+        basis_lora_dict: dict | None,
+        hyper_lora_dict: dict | None,
+    ) -> dict[str, dict[int, dict[str, Tensor]]]:
+        """Convert virtual-name LoRA dicts to real module paths, combining basis + hyper.
+
+        For modules targeted by both basis and hyper:
+            Combined A/B = basis A/B + hyper A/B (additive)
+        For modules targeted by basis only:
+            Use basis A/B directly
+
+        Returns dict mapping real_module_short_name -> layer_idx -> {
+            A: (batch, rank, d_in),
+            B: (batch, rank, d_out)
+        }
+
+        Uses per-layer storage to support heterogeneous dimensions across layer types
+        (e.g., v_proj has d_out=1024 on DeltaNet layers but d_out=256 on FullAttn layers).
+        """
+        from ctx_to_lora.modeling.model_constants import VIRTUAL_MODULE_SPECS
+
+        # Determine batch size from available data
+        sample_dict = hyper_lora_dict or basis_lora_dict
+        if sample_dict is None:
+            return {}
+
+        # Collect all virtual modules
+        all_virtual = set()
+        if basis_lora_dict:
+            all_virtual.update(basis_lora_dict.keys())
+        if hyper_lora_dict:
+            all_virtual.update(hyper_lora_dict.keys())
+
+        # Build per-real-module, per-layer dicts
+        # real_loras[real_name][layer_idx] = {"A": (batch, r, d_in), "B": (batch, r, d_out)}
+        real_loras: dict[str, dict[int, dict[str, Tensor]]] = {}
+
+        for vname in all_virtual:
+            if vname not in VIRTUAL_MODULE_SPECS:
+                continue
+            spec = VIRTUAL_MODULE_SPECS[vname]
+            real_name = spec["real_name"]
+            layer_indices = spec["layer_indices"]
+
+            if real_name not in real_loras:
+                real_loras[real_name] = {}
+
+            # Add basis contribution
+            if basis_lora_dict and vname in basis_lora_dict:
+                basis_A = basis_lora_dict[vname]["A"]  # (batch, n_virtual_layers, rank, d_in)
+                basis_B = basis_lora_dict[vname]["B"]
+                for vi, li in enumerate(layer_indices):
+                    if li not in real_loras[real_name]:
+                        real_loras[real_name][li] = {
+                            "A": basis_A[:, vi],
+                            "B": basis_B[:, vi],
+                        }
+                    else:
+                        real_loras[real_name][li]["A"] = real_loras[real_name][li]["A"] + basis_A[:, vi]
+                        real_loras[real_name][li]["B"] = real_loras[real_name][li]["B"] + basis_B[:, vi]
+
+            # Add hyper contribution
+            if hyper_lora_dict and vname in hyper_lora_dict:
+                hyper_A = hyper_lora_dict[vname]["A"]
+                hyper_B = hyper_lora_dict[vname]["B"]
+                for vi, li in enumerate(layer_indices):
+                    if li not in real_loras[real_name]:
+                        real_loras[real_name][li] = {
+                            "A": hyper_A[:, vi],
+                            "B": hyper_B[:, vi],
+                        }
+                    else:
+                        real_loras[real_name][li]["A"] = real_loras[real_name][li]["A"] + hyper_A[:, vi]
+                        real_loras[real_name][li]["B"] = real_loras[real_name][li]["B"] + hyper_B[:, vi]
+
+        return real_loras
+
+    def forward(
+        self,
+        ctx_ids: Integer[Tensor, "n_ctx ctx_len"] | None = None,
+        ctx_attn_mask: Integer[Tensor, "n_ctx ctx_len"] | None = None,
+        ctx_position_ids: Integer[Tensor, "n_ctx ctx_len"] | None = None,
+        n_ctx_chunks: Integer[Tensor, "n_ctx"] | None = None,
+        n_queries: Integer[Tensor, "n_ctx"] | None = None,
+        return_generated_lora: bool | None = False,
+        *model_inputs_args: Any,
+        **model_inputs_kwargs: dict[str, Any],
+    ) -> tuple | ModelOutput:
+        """Forward pass of HyperDistill model."""
+        generated_loras = None
+        coefficients = None
+
+        if ctx_ids is not None:
+            # Generate LoRA weights
+            basis_loras, hyper_loras, coefficients = self.generate_weights(
+                ctx_ids, ctx_attn_mask, ctx_position_ids,
+            )
+
+            # Combine into real module LoRA dict
+            generated_loras = self._build_real_lora_dict(basis_loras, hyper_loras)
+
+        if generated_loras is not None:
+            position_ids = model_inputs_kwargs.get("position_ids", None)
+
+            if n_queries is None:
+                if ctx_position_ids is None:
+                    n_queries = torch.ones(
+                        ctx_ids.shape[0], dtype=torch.int32, device=self.device
+                    )
+                else:
+                    n_queries = torch.ones(
+                        (ctx_position_ids == 0).sum(),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+
+            apply_per_layer_lora(
+                self.base_model,
+                generated_loras,
+                n_queries,
+                position_ids,
+            )
+
+        model_outputs = self.base_model(*model_inputs_args, **model_inputs_kwargs)
+
+        if return_generated_lora:
+            return model_outputs, (generated_loras, coefficients)
+        return model_outputs
+
+
 # needed for loading model from checkpoint
 # see https://github.com/huggingface/transformers/pull/34632
 torch.serialization.add_safe_globals(
@@ -922,6 +1554,7 @@ torch.serialization.add_safe_globals(
         AggregatorConfig,
         LoraConfig,
         HypernetConfig,
+        HyperDistillConfig,
         PeftType,
         TaskType,
         LoraRuntimeConfig,

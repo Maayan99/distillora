@@ -139,6 +139,7 @@ class DistillationTrainer(ModulatedModelTrainer):
     def __init__(self, *args, **kwargs):
         self.gen_lora_l1_reg_coef = kwargs.pop("gen_lora_l1_reg_coef", 0.0)
         self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
+        self.basis_diversity_coef = kwargs.pop("basis_diversity_coef", 0.0)
         super().__init__(*args, **kwargs)
 
     def compute_loss(
@@ -207,15 +208,35 @@ class DistillationTrainer(ModulatedModelTrainer):
 
         ##### unpack gen lora dict and compute regularization loss
         l1_norm = 0
-        n_modules = len(gen_loras)
-        for module, lora in gen_loras.items():
-            l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
-        l1_norm /= n_modules
-        if is_train:
-            # during eval `num_items_in_batch` will be None
-            l1_norm /= num_items_in_batch["ctx"]
+        if gen_loras is not None:
+            n_modules = len(gen_loras)
+            for module, lora in gen_loras.items():
+                l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
+            l1_norm /= max(n_modules, 1)
+            if is_train:
+                # during eval `num_items_in_batch` will be None
+                l1_norm /= num_items_in_batch["ctx"]
 
         total_loss = loss + self.gen_lora_l1_reg_coef * l1_norm
+
+        ##### basis diversity regularization
+        basis_div_loss = torch.tensor(0.0, device=loss.device)
+        coeff_entropy = torch.tensor(0.0, device=loss.device)
+
+        # Check if model has basis bank (HyperDistill)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped, "basis_bank") and unwrapped.basis_bank is not None:
+            if self.basis_diversity_coef > 0:
+                basis_div_loss = unwrapped.basis_bank.compute_diversity_loss()
+                total_loss = total_loss + self.basis_diversity_coef * basis_div_loss
+
+        # Compute coefficient entropy for logging
+        # gen_loras[1] is coefficients for HyperDistillModel
+        if isinstance(_, torch.Tensor) and _.dim() == 2:
+            # _ is coefficients (batch, n_basis)
+            coefficients = _
+            eps = 1e-8
+            coeff_entropy = -(coefficients * (coefficients + eps).log()).sum(dim=-1).mean()
         #####
 
         scaler = self.args.gradient_accumulation_steps if is_train else 1
@@ -229,12 +250,15 @@ class DistillationTrainer(ModulatedModelTrainer):
             and self.state.global_step % self.state.logging_steps == 0
         ):
             # compensate `num_items_in_batch` division
-            self.log(
-                {
-                    "kl_loss": loss.item() * scaler,
-                    "gen_lora_l1_norm": l1_norm.item() * scaler,
-                }
-            )
+            log_dict = {
+                "kl_loss": loss.item() * scaler,
+                "gen_lora_l1_norm": l1_norm.item() * scaler if isinstance(l1_norm, torch.Tensor) else l1_norm * scaler,
+            }
+            if self.basis_diversity_coef > 0:
+                log_dict["basis_diversity_loss"] = basis_div_loss.item() * scaler
+            if coeff_entropy.item() > 0:
+                log_dict["coefficient_entropy"] = coeff_entropy.item()
+            self.log(log_dict)
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -380,6 +404,178 @@ class CrossEntropyTrainer(ModulatedModelTrainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
 
+class OnlineDistillationTrainer(ModulatedModelTrainer):
+    """Trainer for HyperDistill with online teacher generation.
+
+    The teacher generates responses on-the-fly during training,
+    rather than using pre-computed logprobs.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.gen_lora_l1_reg_coef = kwargs.pop("gen_lora_l1_reg_coef", 0.0)
+        self.use_per_ctx_average_loss = kwargs.pop("use_per_ctx_average_loss", False)
+        self.basis_diversity_coef = kwargs.pop("basis_diversity_coef", 0.0)
+        super().__init__(*args, **kwargs)
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        is_train = num_items_in_batch is not None
+        labels = inputs.pop("labels", None)
+
+        # Get the unwrapped model to access teacher
+        unwrapped = self.accelerator.unwrap_model(model)
+
+        # Check if we have pre-computed logprobs (offline) or need online teacher
+        has_precomputed = "logprobs_vals" in inputs
+
+        if has_precomputed:
+            # Use pre-computed logprobs (same as DistillationTrainer)
+            label_pos = torch.where(labels != -100)
+            outputs, (gen_loras, coefficients) = model(
+                **inputs, return_generated_lora=True
+            )
+
+            if "logprobs_vals" not in inputs:
+                return (torch.tensor(0.0), outputs) if return_outputs else torch.tensor(0.0)
+
+            target_logp = inputs.pop("logprobs_vals").squeeze(0)
+            indices = inputs.pop("logprobs_indices").squeeze(0)
+
+            outputs_logits = outputs.logits[label_pos[0], label_pos[1] - 1]
+            logq_full_denom = torch.logsumexp(outputs_logits, dim=-1, keepdim=True)
+            selected_logits = outputs_logits.gather(1, indices)
+            logq_selected = selected_logits - logq_full_denom
+            p = target_logp.exp()
+            loss = -(p * logq_selected).sum(dim=-1)
+
+        else:
+            # Online teacher: generate response and logprobs on-the-fly
+            # For online mode, inputs should contain the full prompt (system + user)
+            # but no pre-computed teacher responses
+
+            # First, run model forward to generate LoRAs and get student output
+            label_pos = torch.where(labels != -100)
+            outputs, (gen_loras, coefficients) = model(
+                **inputs, return_generated_lora=True
+            )
+
+            # If teacher is available and we have labels, compute online KL
+            if (
+                hasattr(unwrapped, "teacher")
+                and unwrapped.teacher is not None
+                and label_pos[0].numel() > 0
+            ):
+                # Use labels as the target sequence for KL computation
+                # The teacher's logprobs over the response tokens
+                teacher = unwrapped.teacher
+                input_ids = inputs.get("input_ids")
+                attention_mask = inputs.get("attention_mask")
+
+                if input_ids is not None:
+                    with torch.no_grad():
+                        teacher_outputs = teacher.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                        )
+                    teacher_logits = teacher_outputs.logits[
+                        label_pos[0], label_pos[1] - 1
+                    ].float()
+                    teacher_logp = torch.log_softmax(teacher_logits, dim=-1)
+
+                    # Get top-k teacher logprobs
+                    top_k = teacher.top_k
+                    target_logp, indices = torch.topk(teacher_logp, top_k, dim=-1)
+
+                    student_logits = outputs.logits[
+                        label_pos[0], label_pos[1] - 1
+                    ]
+                    logq_full_denom = torch.logsumexp(
+                        student_logits, dim=-1, keepdim=True
+                    )
+                    selected_logits = student_logits.gather(1, indices)
+                    logq_selected = selected_logits - logq_full_denom
+                    p = target_logp.exp()
+                    loss = -(p * logq_selected).sum(dim=-1)
+                else:
+                    loss = torch.tensor(0.0, device=outputs.logits.device)
+            else:
+                # Fallback: CE loss on labels
+                logits = outputs.logits
+                from ctx_to_lora.trainer import causal_lm_ce_loss
+                loss = causal_lm_ce_loss(logits, labels, unwrapped.vocab_size)
+
+        if self.use_per_ctx_average_loss:
+            loss = per_ctx_loss_kl(inputs, labels, loss)
+
+        if is_train:
+            if self.use_per_ctx_average_loss:
+                loss = loss.sum() / num_items_in_batch["ctx"]
+            else:
+                loss = loss.sum() / num_items_in_batch["labels"]
+        else:
+            loss = loss.mean()
+
+        ##### Regularization losses
+        # L1 on generated LoRAs
+        l1_norm = torch.tensor(0.0, device=loss.device)
+        if gen_loras is not None:
+            n_modules = len(gen_loras)
+            for module, lora in gen_loras.items():
+                # Handle both formats:
+                # Old (D2L): lora = {"A": tensor, "B": tensor}
+                # New (HyperDistill per-layer): lora = {layer_idx: {"A": tensor, "B": tensor}}
+                if "A" in lora:
+                    l1_norm += lora["A"].abs().sum(0).mean() + lora["B"].abs().sum(0).mean()
+                else:
+                    for layer_idx, ab in lora.items():
+                        l1_norm += ab["A"].abs().sum(0).mean() + ab["B"].abs().sum(0).mean()
+            l1_norm /= max(n_modules, 1)
+            if is_train:
+                l1_norm /= num_items_in_batch["ctx"]
+
+        total_loss = loss + self.gen_lora_l1_reg_coef * l1_norm
+
+        # Basis diversity
+        basis_div_loss = torch.tensor(0.0, device=loss.device)
+        if (
+            hasattr(unwrapped, "basis_bank")
+            and unwrapped.basis_bank is not None
+            and self.basis_diversity_coef > 0
+        ):
+            basis_div_loss = unwrapped.basis_bank.compute_diversity_loss()
+            total_loss = total_loss + self.basis_diversity_coef * basis_div_loss
+
+        # Coefficient entropy
+        coeff_entropy = torch.tensor(0.0, device=loss.device)
+        if isinstance(coefficients, torch.Tensor) and coefficients.dim() == 2:
+            eps = 1e-8
+            coeff_entropy = -(
+                coefficients * (coefficients + eps).log()
+            ).sum(dim=-1).mean()
+
+        scaler = self.args.gradient_accumulation_steps if is_train else 1
+        if self.args.average_tokens_across_devices and is_train:
+            total_loss *= self.accelerator.num_processes
+            scaler *= self.accelerator.num_processes
+
+        if (self.state.global_step == 1 and self.args.logging_first_step) or (
+            self.args.logging_strategy == IntervalStrategy.STEPS
+            and self.state.global_step % self.state.logging_steps == 0
+        ):
+            log_dict = {
+                "kl_loss": loss.item() * scaler,
+                "gen_lora_l1_norm": l1_norm.item() * scaler,
+            }
+            if self.basis_diversity_coef > 0:
+                log_dict["basis_diversity_loss"] = basis_div_loss.item() * scaler
+            if coeff_entropy.item() > 0:
+                log_dict["coefficient_entropy"] = coeff_entropy.item()
+            self.log(log_dict)
+
+        return (total_loss, outputs) if return_outputs else total_loss
+
+
 def get_decay_parameter_names(model) -> list[str]:
     """
     Get all parameter names that weight decay will be applied to.
@@ -419,7 +615,8 @@ def train_model(
         compute_metrics=compute_metrics,
     )
 
-    is_modulated_model = isinstance(model, ModulatedPretrainedModel)
+    from ctx_to_lora.modeling.hypernet import HyperDistillModel
+    is_modulated_model = isinstance(model, (ModulatedPretrainedModel, HyperDistillModel))
     trainer_cls = Trainer
     if is_modulated_model:
         logger.info("Training with modulated model.")
@@ -434,6 +631,17 @@ def train_model(
         if training_args.use_kl_loss:
             logger.info("Training with distillation loss. Using DistillationTrainer.")
             trainer_cls = DistillationTrainer
+            del training_args.use_kl_loss
+
+        # Pass basis diversity coefficient if available
+        if hasattr(training_args, "basis_diversity_coef"):
+            trainer_kwargs["basis_diversity_coef"] = training_args.basis_diversity_coef
+            del training_args.basis_diversity_coef
+
+        # Use OnlineDistillationTrainer for HyperDistill models
+        if isinstance(model, HyperDistillModel) and training_args.use_kl_loss:
+            logger.info("Using OnlineDistillationTrainer for HyperDistill.")
+            trainer_cls = OnlineDistillationTrainer
             del training_args.use_kl_loss
 
     if training_args.auto_find_batch_size:

@@ -11,6 +11,20 @@ from torch import Tensor
 from ctx_to_lora.utils import get_layers
 
 
+# Module name to path mapping
+ATTN_MODULES = {"q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj"}
+MLP_MODULES = {"down_proj", "up_proj", "gate_proj"}
+
+
+def _get_long_module_name(mname: str) -> str:
+    """Convert short module name to full path within a layer."""
+    if mname in ATTN_MODULES:
+        return f"self_attn.{mname}"
+    elif mname in MLP_MODULES:
+        return f"mlp.{mname}"
+    return mname
+
+
 def lora_forward(
     x: Float[Tensor, "tot_q seq_len d_in"],
     n_qs: Integer[Tensor, "n_ctx"],
@@ -93,13 +107,96 @@ def apply_lora_to_layers(
         layer = layers[layer_idx]
 
         for mname in generated_loras:
-            if mname in ["q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj"]:
-                long_mname = f"self_attn.{mname}"
-            elif mname in ["down_proj", "up_proj", "gate_proj"]:
-                long_mname = f"mlp.{mname}"
+            long_mname = _get_long_module_name(mname)
             module = attrgetter(long_mname)(layer)
             A = generated_loras[mname]["A"][:, layer_idx]
             B = generated_loras[mname]["B"][:, layer_idx]
+            module.forward = partial(module.forward, n_qs=n_qs, tot_q=tot_q, A=A, B=B)
+            if position_ids is not None:
+                module.forward = partial(
+                    module.forward, seq_lens=seq_lens, tot_len=tot_len
+                )
+
+
+def apply_dual_lora_to_layers(
+    model: torch.nn.Module,
+    layer_indices: Iterable[int],
+    basis_loras: dict[str, dict[str, Float[Tensor, "n_ctx n_layers r _"]]],
+    hyper_loras: dict[str, dict[str, Float[Tensor, "n_ctx n_layers r _"]]],
+    n_qs: Integer[Tensor, "n_ctx"],
+    position_ids: Integer[Tensor, "bs seq_len"] = None,
+    basis_scaling: float = 1.0,
+    hyper_scaling: float = 1.0,
+) -> None:
+    """Apply dual (basis + hyper) LoRAs to model layers.
+
+    For modules targeted by both, the LoRA deltas are summed.
+    For modules targeted by only one source, that source is applied alone.
+    """
+    # Merge basis and hyper into a single combined dict
+    all_modules = set()
+    if basis_loras:
+        all_modules.update(basis_loras.keys())
+    if hyper_loras:
+        all_modules.update(hyper_loras.keys())
+
+    combined = {}
+    for mname in all_modules:
+        basis = basis_loras.get(mname) if basis_loras else None
+        hyper = hyper_loras.get(mname) if hyper_loras else None
+
+        if basis and hyper:
+            # Additive combination
+            combined[mname] = {
+                "A": basis["A"] * basis_scaling + hyper["A"] * hyper_scaling,
+                "B": basis["B"] * basis_scaling + hyper["B"] * hyper_scaling,
+            }
+        elif basis:
+            combined[mname] = {
+                "A": basis["A"] * basis_scaling,
+                "B": basis["B"] * basis_scaling,
+            }
+        elif hyper:
+            combined[mname] = {
+                "A": hyper["A"] * hyper_scaling,
+                "B": hyper["B"] * hyper_scaling,
+            }
+
+    apply_lora_to_layers(model, layer_indices, combined, n_qs, position_ids)
+
+
+def apply_per_layer_lora(
+    model: torch.nn.Module,
+    generated_loras: dict[str, dict[int, dict[str, Float[Tensor, "n_ctx r _"]]]],
+    n_qs: Integer[Tensor, "n_ctx"],
+    position_ids: Integer[Tensor, "bs seq_len"] = None,
+) -> None:
+    """Apply LoRAs with per-layer heterogeneous dimensions.
+
+    Args:
+        generated_loras: real_name -> layer_idx -> {"A": (n_ctx, r, d_in), "B": (n_ctx, r, d_out)}
+            Each layer can have different d_in/d_out dimensions.
+        n_qs: Number of queries per context.
+        position_ids: Position IDs for sequence packing.
+    """
+    layers = get_layers(model)
+    if position_ids is not None:
+        position_ids = position_ids.squeeze(0)
+        seq_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
+        seq_lens = torch.cat(
+            [seq_lens, torch.tensor([position_ids[-1]], device=seq_lens.device)]
+        )
+        seq_lens += 1
+        tot_len = seq_lens.sum().item()
+    tot_q = n_qs.sum().item()
+
+    for mname, layer_dict in generated_loras.items():
+        long_mname = _get_long_module_name(mname)
+        for layer_idx, lora_ab in layer_dict.items():
+            layer = layers[layer_idx]
+            module = attrgetter(long_mname)(layer)
+            A = lora_ab["A"]
+            B = lora_ab["B"]
             module.forward = partial(module.forward, n_qs=n_qs, tot_q=tot_q, A=A, B=B)
             if position_ids is not None:
                 module.forward = partial(

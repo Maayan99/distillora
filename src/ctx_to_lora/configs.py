@@ -539,6 +539,46 @@ class CtxEncoderArguments:
 
 
 @dataclass
+class BasisLoRAArguments:
+    n_basis: int = field(
+        default=8,
+        metadata={"help": "Number of basis LoRAs in the bank."},
+    )
+    basis_rank: int = field(
+        default=8,
+        metadata={"help": "LoRA rank for each basis."},
+    )
+    basis_diversity_coef: float = field(
+        default=0.01,
+        metadata={"help": "Cosine similarity penalty between bases."},
+    )
+    per_module_routing: bool = field(
+        default=True,
+        metadata={"help": "Per-module scaling of global coefficients."},
+    )
+    n_refinement_blocks: int = field(
+        default=2,
+        metadata={"help": "Number of self-attention refinement blocks."},
+    )
+
+
+@dataclass
+class TeacherArguments:
+    teacher_model_name_or_path: str = field(
+        default=None,
+        metadata={"help": "Teacher model for online distillation."},
+    )
+    teacher_top_k: int = field(
+        default=16,
+        metadata={"help": "Top-k logprobs to extract from teacher."},
+    )
+    teacher_max_new_tokens: int = field(
+        default=256,
+        metadata={"help": "Max new tokens for teacher generation."},
+    )
+
+
+@dataclass
 class AggregatorArguments:
     aggregator_type: Literal["pooler", "perceiver"] = field(
         default="perceiver",
@@ -585,6 +625,8 @@ torch.serialization.add_safe_globals(
         HypernetArguments,
         AggregatorArguments,
         CtxEncoderArguments,
+        BasisLoRAArguments,
+        TeacherArguments,
     ]
 )
 

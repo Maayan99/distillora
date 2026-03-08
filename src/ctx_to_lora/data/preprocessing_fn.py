@@ -43,6 +43,18 @@ def get_preprocessing_fn(
         # already processed data, do nothing
         return f
 
+    if ds_name == "system_prompts":
+
+        def f(sample):
+            return {
+                "context": sample["context"],
+                "prompts": [sample["question"]],
+                "responses": [sample.get("answer", "")],
+                "system_message": sample["context"],
+            }
+
+        return f
+
     if "fw_qa_v2" in ds_name:
 
         def f(sample):

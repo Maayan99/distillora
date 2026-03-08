@@ -247,6 +247,66 @@ def get_lora_module_names(
     return module_names
 
 
+def get_projection_specs(
+    model,
+    target_modules: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Directly inspect model to get per-module feature sizes.
+
+    Unlike get_peft_in_out_features, this works on plain (non-PEFT) models
+    and does NOT assert uniform dimensions across layers.
+
+    Returns:
+        (in_features, out_features) dicts keyed by module short name.
+        For modules with varying sizes across layers, returns the most common size.
+    """
+    from collections import Counter
+    in_features = {}
+    out_features = {}
+
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        short_name = name.split(".")[-1]
+        if short_name not in target_modules:
+            continue
+
+        if short_name not in in_features:
+            in_features[short_name] = Counter()
+            out_features[short_name] = Counter()
+
+        in_features[short_name][module.in_features] += 1
+        out_features[short_name][module.out_features] += 1
+
+    # Return the most common size for each module
+    result_in = {k: v.most_common(1)[0][0] for k, v in in_features.items()}
+    result_out = {k: v.most_common(1)[0][0] for k, v in out_features.items()}
+    return result_in, result_out
+
+
+def get_per_layer_projection_specs(
+    model,
+    target_modules: list[str],
+) -> dict[str, list[tuple[int, int]]]:
+    """Get per-layer (in_features, out_features) for each target module.
+
+    Returns dict mapping module_name -> list of (in_features, out_features) per layer.
+    """
+    from ctx_to_lora.utils import get_layers
+    layers = get_layers(model)
+    specs = {m: [] for m in target_modules}
+
+    for layer in layers:
+        for name, module in layer.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            short_name = name.split(".")[-1]
+            if short_name in target_modules:
+                specs[short_name].append((module.in_features, module.out_features))
+
+    return specs
+
+
 def compile_linear(model):
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):

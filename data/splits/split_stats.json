@@ -1,0 +1,40 @@
+{
+  "total": 18065,
+  "train": 12704,
+  "eval": 1829,
+  "test": 889,
+  "train_off_topic": 0,
+  "eval_off_topic": 311,
+  "test_off_topic": 155,
+  "unique_sps": 1568,
+  "avg_context_chars": 1001.9,
+  "avg_answer_chars": 1979.8,
+  "category_distribution": {
+    "behavioral_constraint": 1788,
+    "conditional_logic": 1652,
+    "knowledge_injection": 2225,
+    "language_task": 1560,
+    "multi_constraint": 2250,
+    "output_format": 1962,
+    "persona": 2085,
+    "refusal_redirection": 1502,
+    "tool_simulation": 1241,
+    "voice_style": 1800
+  },
+  "question_type_distribution": {
+    "off_topic": 3109,
+    "on_topic": 14956
+  },
+  "difficulty_distribution": {
+    "easy": 4511,
+    "hard": 4483,
+    "medium": 5962,
+    "off_topic": 3109
+  },
+  "ratios": {
+    "train": 0.85,
+    "eval": 0.1,
+    "test": 0.05
+  },
+  "seed": 42
+}
