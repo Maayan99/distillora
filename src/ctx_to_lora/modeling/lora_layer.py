@@ -13,11 +13,18 @@ from ctx_to_lora.utils import get_layers
 
 # Module name to path mapping
 ATTN_MODULES = {"q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj"}
+LINEAR_ATTN_MODULES = {"in_proj_qkv", "out_proj", "in_proj_z", "in_proj_a", "in_proj_b"}
 MLP_MODULES = {"down_proj", "up_proj", "gate_proj"}
 
 
 def _get_long_module_name(mname: str) -> str:
-    """Convert short module name to full path within a layer."""
+    """Convert short module name to full path within a layer.
+
+    Handles both standard attention (self_attn.*) and DeltaNet (linear_attn.*) modules.
+    If the mname already contains a dot (e.g. "linear_attn.out_proj"), return as-is.
+    """
+    if "." in mname:
+        return mname
     if mname in ATTN_MODULES:
         return f"self_attn.{mname}"
     elif mname in MLP_MODULES:

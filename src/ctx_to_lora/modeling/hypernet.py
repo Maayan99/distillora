@@ -1416,39 +1416,40 @@ class HyperDistillModel(nn.Module):
             if vname not in VIRTUAL_MODULE_SPECS:
                 continue
             spec = VIRTUAL_MODULE_SPECS[vname]
-            real_name = spec["real_name"]
+            # Use full module path (e.g. "self_attn.q_proj", "linear_attn.out_proj", "mlp.down_proj")
+            full_path = f"{spec['path_prefix']}.{spec['real_name']}"
             layer_indices = spec["layer_indices"]
 
-            if real_name not in real_loras:
-                real_loras[real_name] = {}
+            if full_path not in real_loras:
+                real_loras[full_path] = {}
 
             # Add basis contribution
             if basis_lora_dict and vname in basis_lora_dict:
                 basis_A = basis_lora_dict[vname]["A"]  # (batch, n_virtual_layers, rank, d_in)
                 basis_B = basis_lora_dict[vname]["B"]
                 for vi, li in enumerate(layer_indices):
-                    if li not in real_loras[real_name]:
-                        real_loras[real_name][li] = {
+                    if li not in real_loras[full_path]:
+                        real_loras[full_path][li] = {
                             "A": basis_A[:, vi],
                             "B": basis_B[:, vi],
                         }
                     else:
-                        real_loras[real_name][li]["A"] = real_loras[real_name][li]["A"] + basis_A[:, vi]
-                        real_loras[real_name][li]["B"] = real_loras[real_name][li]["B"] + basis_B[:, vi]
+                        real_loras[full_path][li]["A"] = real_loras[full_path][li]["A"] + basis_A[:, vi]
+                        real_loras[full_path][li]["B"] = real_loras[full_path][li]["B"] + basis_B[:, vi]
 
             # Add hyper contribution
             if hyper_lora_dict and vname in hyper_lora_dict:
                 hyper_A = hyper_lora_dict[vname]["A"]
                 hyper_B = hyper_lora_dict[vname]["B"]
                 for vi, li in enumerate(layer_indices):
-                    if li not in real_loras[real_name]:
-                        real_loras[real_name][li] = {
+                    if li not in real_loras[full_path]:
+                        real_loras[full_path][li] = {
                             "A": hyper_A[:, vi],
                             "B": hyper_B[:, vi],
                         }
                     else:
-                        real_loras[real_name][li]["A"] = real_loras[real_name][li]["A"] + hyper_A[:, vi]
-                        real_loras[real_name][li]["B"] = real_loras[real_name][li]["B"] + hyper_B[:, vi]
+                        real_loras[full_path][li]["A"] = real_loras[full_path][li]["A"] + hyper_A[:, vi]
+                        real_loras[full_path][li]["B"] = real_loras[full_path][li]["B"] + hyper_B[:, vi]
 
         return real_loras
 
