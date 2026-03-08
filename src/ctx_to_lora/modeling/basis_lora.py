@@ -60,7 +60,7 @@ class BasisLoRABank(nn.Module):
             nn.init.normal_(
                 self.basis_B[vname],
                 mean=0,
-                std=0.001 / sqrt(d_out * rank),
+                std=0.0003 / sqrt(d_out * rank),
             )
 
             # Initialize A ~ N(0, 0.2 / sqrt(d_in * r))
