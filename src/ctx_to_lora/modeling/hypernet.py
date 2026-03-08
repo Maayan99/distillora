@@ -1087,9 +1087,6 @@ class HyperDistillModel(nn.Module):
         # Register base model (student, frozen)
         self.register_module("base_model", base_model)
 
-        # Expose vocab_size for loss computation
-        self.vocab_size = getattr(base_model.config, "vocab_size", None)
-
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """Delegate gradient checkpointing to the base (student) model."""
         self.base_model.gradient_checkpointing_enable(
