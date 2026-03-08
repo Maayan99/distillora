@@ -1087,15 +1087,6 @@ class HyperDistillModel(nn.Module):
         # Register base model (student, frozen)
         self.register_module("base_model", base_model)
 
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Delegate gradient checkpointing to the base (student) model."""
-        self.base_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
-        )
-
-    def gradient_checkpointing_disable(self):
-        self.base_model.gradient_checkpointing_disable()
-
         # Teacher (frozen, for online distillation)
         if teacher is not None:
             self.register_module("teacher", teacher)
@@ -1109,6 +1100,15 @@ class HyperDistillModel(nn.Module):
             self.basis_bank = None
 
         self._init_model()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Delegate gradient checkpointing to the base (student) model."""
+        self.base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+        )
+
+    def gradient_checkpointing_disable(self):
+        self.base_model.gradient_checkpointing_disable()
 
     @property
     def vocab_size(self):
