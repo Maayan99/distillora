@@ -40,9 +40,22 @@ class ArgumentParser(HfArgumentParser):
 
         outputs = []
         # strip other args list into dict of key-value pairs
-        other_args = {
-            arg.split("=")[0].strip("-"): arg.split("=")[1] for arg in other_args
-        }
+        parsed_other_args = {}
+        i = 0
+        while i < len(other_args):
+            arg = other_args[i]
+            if "=" in arg:
+                key, val = arg.split("=", 1)
+                parsed_other_args[key.strip("-")] = val
+            elif arg.startswith("--"):
+                key = arg.strip("-")
+                if i + 1 < len(other_args) and not other_args[i + 1].startswith("--"):
+                    parsed_other_args[key] = other_args[i + 1]
+                    i += 1
+                else:
+                    parsed_other_args[key] = "True"
+            i += 1
+        other_args = parsed_other_args
         used_args = {}
 
         # overwrite the default/loaded value with the value provided to the command line
