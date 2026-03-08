@@ -102,17 +102,24 @@ def try_convert(s):
 
 def extract_cli_args(argv: list[str]):
     out = dict()
-    for elem in argv:
+    i = 0
+    while i < len(argv):
+        elem = argv[i]
         if elem.endswith(".yaml"):
             out["config"] = elem
-
         elif elem.startswith("--"):
-            k, v = elem.split("=")
-            k = k.split("--")[1]
-            v = try_convert(v)
-            # if k.startswith('env_'):
-            #     k = k.split('_')[1]
-            out[k] = v
+            if "=" in elem:
+                k, v = elem.split("=", 1)
+                k = k.lstrip("-")
+                out[k] = try_convert(v)
+            else:
+                k = elem.lstrip("-")
+                if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                    out[k] = try_convert(argv[i + 1])
+                    i += 1
+                else:
+                    out[k] = True
+        i += 1
     return out
 
 
