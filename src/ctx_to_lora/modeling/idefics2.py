@@ -677,13 +677,10 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
 
         latents = self.latents_q.unsqueeze(0).expand((bsz, *self.latents_q.size()))
 
-        attention_mask = (
-            _prepare_4d_attention_mask(
+        if attention_mask is not None and not self._use_flash_attention_2:
+            attention_mask = _prepare_4d_attention_mask(
                 attention_mask, latents.dtype, tgt_len=self.n_latents
             )
-            if not self._use_flash_attention_2
-            else attention_mask
-        )
 
         compressed_context = latents
 
