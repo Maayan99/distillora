@@ -1144,6 +1144,11 @@ class HyperDistillModel(nn.Module):
             for v in config.hyper_target_modules
             if v in config.basis_module_specs
         )
+        logger.info(
+            f"[DEBUG INIT] n_output_queries={n_output_queries}, lora_rank={config.lora_rank}, "
+            f"hyper_target_modules={config.hyper_target_modules}, "
+            f"basis_module_specs={config.basis_module_specs}"
+        )
 
         from ctx_to_lora.modeling.idefics2 import Idefics2Perceiver, Idefics2PerceiverConfig
 
@@ -1359,12 +1364,22 @@ class HyperDistillModel(nn.Module):
         hconfig = self.hyperdistill_config
         latent_queries = {}
         offset = 0
+        logger.info(
+            f"[DEBUG] flat_latents.shape={flat_latents.shape}, "
+            f"hyper_target_modules={hconfig.hyper_target_modules}, "
+            f"lora_rank={hconfig.lora_rank}, latent_size={hconfig.latent_size}"
+        )
         for vname in hconfig.hyper_target_modules:
             if vname not in hconfig.basis_module_specs:
                 continue
             n_layers = hconfig.basis_module_specs[vname][0]
             n_queries = n_layers * hconfig.lora_rank
+            logger.info(
+                f"[DEBUG] vname={vname}, n_layers={n_layers}, n_queries={n_queries}, "
+                f"offset={offset}, slice=[{offset}:{offset+n_queries}]"
+            )
             queries = flat_latents[:, offset:offset + n_queries]
+            logger.info(f"[DEBUG] queries.shape={queries.shape}, queries.numel()={queries.numel()}")
             queries = queries.view(bs, n_layers, hconfig.lora_rank, hconfig.latent_size)
             latent_queries[vname] = queries
             offset += n_queries
