@@ -171,7 +171,7 @@ def load_teacher(
         device_map=device,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     model.eval()
     for param in model.parameters():

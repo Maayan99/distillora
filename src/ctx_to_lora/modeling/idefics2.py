@@ -447,9 +447,58 @@ class Idefics2PerceiverFlashAttention2(Idefics2PerceiverAttention):
         return attn_output, attn_weights, past_key_value
 
 
+class Idefics2PerceiverSdpaAttention(Idefics2PerceiverAttention):
+    """SDPA-based perceiver attention (no flash_attn dependency)."""
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        is_cross_attn: bool,
+        context: torch.Tensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        bsz, q_len, _ = latents.size()
+        query_states = self.q_proj(latents)
+        kv_inp = context if is_cross_attn else latents
+
+        key_states = self.k_proj(kv_inp)
+        value_states = self.v_proj(kv_inp)
+
+        query_states = query_states.view(
+            *latents.shape[:2], self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            *kv_inp.shape[:2], self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            *kv_inp.shape[:2], self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=attention_mask if attention_mask is not None and attention_mask.dim() == 4 else None,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, None
+
+
 IDEFICS2_PERCEIVER_ATTENTION_CLASSES = {
     # "eager": Idefics2PerceiverAttention,
     "flash_attention_2": Idefics2PerceiverFlashAttention2,
+    "sdpa": Idefics2PerceiverSdpaAttention,
 }
 
 
@@ -612,7 +661,6 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
         self.layernorm = Idefics2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        assert self._use_flash_attention_2
 
     def forward(
         self,

@@ -120,9 +120,13 @@ def get_model(
     )
 
     if use_flash_attn:
-        if "gte" not in model_name_or_path:
-            model_init_kwargs["attn_implementation"] = "flash_attention_2"
-        elif "gte" in model_name_or_path:
+        try:
+            import flash_attn  # noqa: F401
+            if "gte" not in model_name_or_path:
+                model_init_kwargs["attn_implementation"] = "flash_attention_2"
+            else:
+                model_init_kwargs["attn_implementation"] = "sdpa"
+        except ImportError:
             model_init_kwargs["attn_implementation"] = "sdpa"
 
     if is_vision_model:

@@ -1156,7 +1156,7 @@ class HyperDistillModel(nn.Module):
             n_latents=config.aggregator_config.n_latent_queries,
             intermediate_size_factor=4,
             hidden_size=config.latent_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         decoder_config = Idefics2PerceiverConfig(
             input_size=config.latent_size,
@@ -1166,7 +1166,7 @@ class HyperDistillModel(nn.Module):
             n_latents=n_output_queries,
             intermediate_size_factor=4,
             hidden_size=config.latent_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         self.perceiver = Idefics2Perceiver(encoder_config, decoder_config)
 
