@@ -505,7 +505,7 @@ def main():
         else:
             base_model = model.base_model
 
-        if ctx_name is not None:
+        if ctx_name is not None and not use_hyperdistill:
             logger.info("Compiling ctx_encoder_model")
             ctx_base_model = model.ctx_encoder.base_model
             compile_linear(ctx_base_model)
@@ -513,8 +513,11 @@ def main():
     elif isinstance(model, PeftModel):
         base_model = model.base_model
 
-    logger.info("Compiling base_model")
-    base_model.compile(fullgraph=True, mode="max-autotune")
+    if not use_hyperdistill:
+        logger.info("Compiling base_model")
+        base_model.compile(fullgraph=True, mode="max-autotune")
+    else:
+        logger.info("Skipping torch.compile for HyperDistill (incompatible with dynamic LoRA patching)")
 
     if LOCAL_RANK == 0:
         wandb.init(
