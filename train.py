@@ -123,8 +123,9 @@ def main():
     # still possible to have a name crash though
     # logging_dir is just "runs/DATE_TIME_HOSTNAME"
     slurm_job_id = f"_{os.getenv('SLURM_JOB_ID')}" if os.getenv("SLURM_JOB_ID") else ""
+    logging_dir_seed = (training_args.logging_dir or "").strip("runs/") + slurm_job_id
     run_name = (
-        get_run_name(seed_str=training_args.logging_dir.strip("runs/") + slurm_job_id)
+        get_run_name(seed_str=logging_dir_seed)
         if not checkpoint_dir
         else checkpoint_dir.strip("/").split("/")[-2]
     )
