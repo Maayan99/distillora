@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 
 import torch
 from torch import nn
@@ -429,6 +430,11 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
         self._last_coefficients = None
         self._step_start_time = None
         self._last_logged_step = -1
+        self._loss_window = {
+            "kl": deque(maxlen=10),
+            "l1_reg": deque(maxlen=10),
+            "total": deque(maxlen=10),
+        }
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -599,6 +605,13 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             # LoRA norm stats
             if gen_loras is not None:
                 self._log_lora_norms(log_dict, gen_loras, unwrapped)
+
+            # Rolling window averages
+            self._loss_window["kl"].append(log_dict["loss/kl"])
+            self._loss_window["l1_reg"].append(log_dict["loss/l1_reg"])
+            self._loss_window["total"].append(log_dict["loss/total"])
+            for key, window in self._loss_window.items():
+                log_dict[f"loss_avg10/{key}"] = sum(window) / len(window)
 
             # Gradient norms
             self._log_gradient_norms(log_dict, unwrapped)
