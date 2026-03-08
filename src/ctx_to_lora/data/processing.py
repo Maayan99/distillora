@@ -327,9 +327,9 @@ def get_tokenized_dataset(
     )
     if use_kl_loss:
         if "train" in split and "logprobs_vals" not in ds.column_names:
-            raise ValueError(
-                "`use_kl_loss` is set to True but 'logprobs_vals' column "
-                "is not present in the dataset."
+            logger.info(
+                "use_kl_loss=True but no pre-computed logprobs in dataset. "
+                "Assuming online teacher will provide logprobs at runtime."
             )
     logger.info(f"Constructing and tokenizing {ds_name} with {split} split...")
     if flip_ctx_inp:
