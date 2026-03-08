@@ -615,7 +615,7 @@ IDEFICS2_INPUTS_DOCSTRING = r"""
     IDEFICS2_START_DOCSTRING,
 )
 class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
-    _supports_sdpa = False
+    _supports_sdpa = True
     config_class = Idefics2PerceiverConfig
 
     def __init__(self, config) -> None:
