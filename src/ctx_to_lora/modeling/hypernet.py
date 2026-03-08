@@ -1009,7 +1009,7 @@ class MultiHeadHyperLoRA(nn.Module):
                     torch.ones(1, n_layers, self.rank, 1)
                 )
                 self.scaler_B[vname] = nn.Parameter(
-                    torch.full((1, n_layers, self.rank, 1), 0.0003)
+                    torch.full((1, n_layers, self.rank, 1), 0.01)
                 )
 
     def forward(
@@ -1086,7 +1086,8 @@ class HyperDistillModel(nn.Module):
         self.ctx_encoder_args = ctx_encoder_args
         self.use_sequence_packing = use_sequence_packing
         self.model_accepts_loss_kwargs = True
-        self.lora_alpha = lora_alpha or config.lora_alpha or float(config.lora_rank)
+        alpha = lora_alpha or config.lora_alpha or float(config.lora_rank)
+        self.lora_alpha = alpha / float(config.lora_rank)
 
         # Register base model (student, frozen)
         self.register_module("base_model", base_model)
