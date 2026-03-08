@@ -176,7 +176,14 @@ def load_plain_model(
     train: bool = True,
 ):
     """Load a model without PEFT wrapping, for direct LoRA monkey-patching."""
-    attn_impl = "flash_attention_2" if use_flash_attn else "eager"
+    if use_flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            attn_impl = "sdpa"
+    else:
+        attn_impl = "sdpa"
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         device_map=device,
