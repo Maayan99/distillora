@@ -109,7 +109,7 @@ def get_model(
         torch_dtype=dtype,
         trust_remote_code=True,
         attn_implementation="eager",
-        use_cache=None,
+        # use_cache=None,  # not accepted by all model architectures
     )
     is_vision_model = check_is_vision_model(model_name_or_path)
     if model_kwargs is not None:
@@ -132,10 +132,10 @@ def get_model(
     if is_vision_model:
         # always use sdpa for vision models
         # model_init_kwargs["attn_implementation"] = "sdpa"
-        model_init_kwargs.pop("use_cache")
+        model_init_kwargs.pop("use_cache", None)
     elif is_bidir_model:
         model_init_kwargs["torch_dtype"] = torch.float32
-        model_init_kwargs.pop("use_cache")
+        model_init_kwargs.pop("use_cache", None)
 
     if use_q_lora:
         # https://huggingface.co/blog/4bit-transformers-bitsandbytes
