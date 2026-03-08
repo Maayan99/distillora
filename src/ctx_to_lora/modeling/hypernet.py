@@ -1144,11 +1144,6 @@ class HyperDistillModel(nn.Module):
             for v in config.hyper_target_modules
             if v in config.basis_module_specs
         )
-        logger.info(
-            f"[DEBUG INIT] n_output_queries={n_output_queries}, lora_rank={config.lora_rank}, "
-            f"hyper_target_modules={config.hyper_target_modules}, "
-            f"basis_module_specs={config.basis_module_specs}"
-        )
 
         from ctx_to_lora.modeling.idefics2 import Idefics2Perceiver, Idefics2PerceiverConfig
 
@@ -1344,9 +1339,12 @@ class HyperDistillModel(nn.Module):
             features_flat = ctx_features
             attn_mask_for_perceiver = ctx_attn_mask
 
-        # 3. Perceiver: (bs, seq, d) -> (bs, n_output_queries, d)
+        # 3. Perceiver: (bs, seq, d) -> (n_ctx, n_output_queries, d)
+        #    The perceiver may unpack packed sequences via position_ids,
+        #    so output batch size (n_ctx) can differ from input batch size.
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             flat_latents = self.perceiver(features_flat, attn_mask_for_perceiver, ctx_position_ids)
+        bs = flat_latents.shape[0]  # actual number of contexts (may differ from packed batch size)
 
         # 4. Coefficient head: pool latents → basis coefficients
         basis_lora_dict = None
@@ -1364,22 +1362,12 @@ class HyperDistillModel(nn.Module):
         hconfig = self.hyperdistill_config
         latent_queries = {}
         offset = 0
-        logger.info(
-            f"[DEBUG] flat_latents.shape={flat_latents.shape}, "
-            f"hyper_target_modules={hconfig.hyper_target_modules}, "
-            f"lora_rank={hconfig.lora_rank}, latent_size={hconfig.latent_size}"
-        )
         for vname in hconfig.hyper_target_modules:
             if vname not in hconfig.basis_module_specs:
                 continue
             n_layers = hconfig.basis_module_specs[vname][0]
             n_queries = n_layers * hconfig.lora_rank
-            logger.info(
-                f"[DEBUG] vname={vname}, n_layers={n_layers}, n_queries={n_queries}, "
-                f"offset={offset}, slice=[{offset}:{offset+n_queries}]"
-            )
             queries = flat_latents[:, offset:offset + n_queries]
-            logger.info(f"[DEBUG] queries.shape={queries.shape}, queries.numel()={queries.numel()}")
             queries = queries.view(bs, n_layers, hconfig.lora_rank, hconfig.latent_size)
             latent_queries[vname] = queries
             offset += n_queries
