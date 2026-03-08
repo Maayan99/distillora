@@ -105,14 +105,20 @@ class ArgumentParser(HfArgumentParser):
             )
         # parse --config for the yaml path and other command line args
         elif any([arg.startswith("--config") for arg in sys.argv]):
-            yaml_arg = [
-                arg
-                for arg in sys.argv[1:]
-                if arg.startswith("--config") and arg.endswith(".yaml")
-            ][0]
-            other_args = [arg for arg in sys.argv[1:] if arg != yaml_arg]
+            args = sys.argv[1:]
+            # Handle both --config=path.yaml and --config path.yaml
+            yaml_path = None
+            config_indices = []
+            for i, arg in enumerate(args):
+                if arg.startswith("--config=") and arg.endswith(".yaml"):
+                    yaml_path = arg.split("=", 1)[-1]
+                    config_indices.append(i)
+                elif arg == "--config" and i + 1 < len(args):
+                    yaml_path = args[i + 1]
+                    config_indices.extend([i, i + 1])
+            other_args = [a for i, a in enumerate(args) if i not in config_indices]
             output = self.parse_yaml_and_args(
-                os.path.abspath(yaml_arg.split("=")[-1]), other_args
+                os.path.abspath(yaml_path), other_args
             )
         # parse command line args only
         else:
