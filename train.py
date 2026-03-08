@@ -221,6 +221,9 @@ def main():
         ctx_encoder_model_config = AutoConfig.from_pretrained(
             ctx_name, trust_remote_code=True
         )
+        # Some models (e.g. Qwen3.5) nest the text config under a parent config
+        if hasattr(ctx_encoder_model_config, "text_config"):
+            ctx_encoder_model_config = ctx_encoder_model_config.text_config
 
         # Set ctx_encoder_last_layer
         if ctx_encoder_args.ctx_encoder_last_layer is None:
