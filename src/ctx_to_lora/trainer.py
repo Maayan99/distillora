@@ -673,38 +673,15 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
         return loss
 
     def _log_lora_norms(self, log_dict, gen_loras, unwrapped):
-        """Log Frobenius norms of basis and hyper LoRAs."""
-        total_basis_norm = 0.0
-        total_hyper_norm = 0.0
-        n_basis_entries = 0
-        n_hyper_entries = 0
+        """Log Frobenius norms of basis and hyper LoRA outputs."""
+        # Use output norms stored during forward pass (apples-to-apples comparison)
+        basis_out = getattr(unwrapped, "_last_basis_output_norm", None)
+        hyper_out = getattr(unwrapped, "_last_hyper_output_norm", None)
 
-        for mname, lora in gen_loras.items():
-            if "A" in lora:
-                # Old format
-                norm_a = lora["A"].norm().item()
-                norm_b = lora["B"].norm().item()
-                log_dict[f"lora_norm/{mname}_A"] = norm_a
-                log_dict[f"lora_norm/{mname}_B"] = norm_b
-            else:
-                # Per-layer format: aggregate across layers
-                norm_a = sum(ab["A"].norm().item() for ab in lora.values())
-                norm_b = sum(ab["B"].norm().item() for ab in lora.values())
-                total_hyper_norm += norm_a + norm_b
-                n_hyper_entries += len(lora)
-
-        # Basis bank norms
-        if hasattr(unwrapped, "basis_bank") and unwrapped.basis_bank is not None:
-            for vname in unwrapped.basis_bank.module_specs:
-                ba = unwrapped.basis_bank.basis_A[vname].norm().item()
-                bb = unwrapped.basis_bank.basis_B[vname].norm().item()
-                total_basis_norm += ba + bb
-                n_basis_entries += 1
-
-        if n_basis_entries > 0 and n_hyper_entries > 0:
-            log_dict["lora_norm/basis_to_hyper_ratio"] = (
-                total_basis_norm / max(total_hyper_norm, 1e-8)
-            )
+        if basis_out is not None and hyper_out is not None and hyper_out > 0:
+            log_dict["lora_norm/basis_to_hyper_ratio"] = basis_out / hyper_out
+            log_dict["lora_norm/basis_output"] = basis_out
+            log_dict["lora_norm/hyper_output"] = hyper_out
 
     def _log_gradient_norms(self, log_dict, unwrapped):
         """Log gradient norms per component."""

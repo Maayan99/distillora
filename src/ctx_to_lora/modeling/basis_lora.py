@@ -57,12 +57,13 @@ class BasisLoRABank(nn.Module):
             self.basis_B[vname] = nn.Parameter(
                 torch.empty(n_basis, n_layers, rank, d_out)
             )
-            # Scale by rank only (not d_out) so basis pathway magnitude
-            # matches hyper pathway (~2e-5 per element A*B product).
+            # Scale by rank only (not d_out). Use large std so basis output
+            # dominates hyper at init (~10x), forcing coefficient head to learn
+            # basis selection via strong gradient signal.
             nn.init.normal_(
                 self.basis_B[vname],
                 mean=0,
-                std=0.01 / sqrt(rank),
+                std=0.1 / sqrt(rank),
             )
 
             # Initialize A ~ N(0, 0.2 / sqrt(d_in * r))

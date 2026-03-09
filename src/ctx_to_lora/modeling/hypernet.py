@@ -1370,7 +1370,10 @@ class HyperDistillModel(nn.Module):
             basis_lora_dict = self.basis_bank.mix(coefficients)
 
             # 6. Refinement: inject coefficients into latents
-            flat_latents = self.refinement_blocks(flat_latents, coefficients)
+            # Detach coefficients so gradient to coefficient head flows only
+            # through basis mixing, not through the refinement→hyper shortcut.
+            # Refinement blocks still see coefficient values for conditioning.
+            flat_latents = self.refinement_blocks(flat_latents, coefficients.detach())
 
         # 7. Split flat latents into per-module queries
         hconfig = self.hyperdistill_config
@@ -1493,6 +1496,16 @@ class HyperDistillModel(nn.Module):
 
             # Combine into real module LoRA dict
             generated_loras = self._build_real_lora_dict(basis_loras, hyper_loras)
+
+            # Store output norms for diagnostics (avoids changing return signature)
+            self._last_basis_output_norm = sum(
+                v["A"].norm().item() + v["B"].norm().item()
+                for v in basis_loras.values()
+            ) if basis_loras else 0.0
+            self._last_hyper_output_norm = sum(
+                v["A"].norm().item() + v["B"].norm().item()
+                for v in hyper_loras.values()
+            ) if hyper_loras else 0.0
 
         if generated_loras is not None:
             position_ids = model_inputs_kwargs.get("position_ids", None)
