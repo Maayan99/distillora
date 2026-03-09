@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+import time
 from copy import deepcopy
 from functools import partial
 
@@ -116,7 +117,12 @@ def main():
         f"Please set use_sequence_packing=True in {ctx_args}. It's faster!"
     )
 
+    # Randomize seed across runs unless explicitly set in config
+    if training_args.seed == 42:  # HF default — not explicitly set
+        training_args.seed = int(time.time()) % 2**31
+        logger.info(f"Using random seed={training_args.seed}")
     set_seed(training_args.seed)
+
     checkpoint_dir = training_args.resume_from_checkpoint
 
     # should be the same across processes
