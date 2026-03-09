@@ -437,6 +437,34 @@ class OnlineDistillationTrainer(ModulatedModelTrainer):
             "total": deque(maxlen=10),
         }
 
+    def create_optimizer(self):
+        """Separate param groups: 10x higher LR for coefficient head."""
+        from torch.optim import AdamW
+
+        coeff_params = []
+        other_params = []
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        coeff_head_params = (
+            set(id(p) for p in unwrapped.coefficient_head.parameters())
+            if hasattr(unwrapped, "coefficient_head")
+            and unwrapped.coefficient_head is not None
+            else set()
+        )
+
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) in coeff_head_params:
+                coeff_params.append(p)
+            else:
+                other_params.append(p)
+
+        self.optimizer = AdamW([
+            {"params": other_params, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
+            {"params": coeff_params, "lr": self.args.learning_rate * 10, "weight_decay": self.args.weight_decay},
+        ])
+        return self.optimizer
+
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):

@@ -57,10 +57,12 @@ class BasisLoRABank(nn.Module):
             self.basis_B[vname] = nn.Parameter(
                 torch.empty(n_basis, n_layers, rank, d_out)
             )
+            # Scale by rank only (not d_out) so basis pathway magnitude
+            # matches hyper pathway (~2e-5 per element A*B product).
             nn.init.normal_(
                 self.basis_B[vname],
                 mean=0,
-                std=0.001 / sqrt(d_out * rank),
+                std=0.01 / sqrt(rank),
             )
 
             # Initialize A ~ N(0, 0.2 / sqrt(d_in * r))
@@ -103,9 +105,15 @@ class BasisLoRABank(nn.Module):
             if self.per_module_routing:
                 # Per-module modulated coefficients in logit space
                 alpha = self.module_routing[vname]  # (n_basis,)
-                c = F.softmax(logits * alpha.unsqueeze(0), dim=-1)  # (batch, n_basis)
+                scaled_logits = logits * alpha.unsqueeze(0)
             else:
-                c = F.softmax(logits, dim=-1)  # (batch, n_basis)
+                scaled_logits = logits
+
+            if self.training:
+                # Gumbel-softmax breaks symmetry and explores basis combinations
+                c = F.gumbel_softmax(scaled_logits, tau=1.0, hard=False, dim=-1)
+            else:
+                c = F.softmax(scaled_logits, dim=-1)  # (batch, n_basis)
 
             # Weighted sum: c @ basis -> (batch, n_layers, r, d)
             # basis_A[vname]: (n_basis, n_layers, r, d_in)
