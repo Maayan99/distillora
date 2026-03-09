@@ -111,8 +111,10 @@ class BasisLoRABank(nn.Module):
                 scaled_logits = logits
 
             if self.training:
-                # Gumbel-softmax breaks symmetry and explores basis combinations
-                c = F.gumbel_softmax(scaled_logits, tau=1.0, hard=False, dim=-1)
+                # Hard Gumbel routing: each sample selects ONE basis (forward),
+                # with straight-through gradient (backward). Forces bases to
+                # specialize by receiving different gradients from different samples.
+                c = F.gumbel_softmax(scaled_logits, tau=0.5, hard=True, dim=-1)
             else:
                 c = F.softmax(scaled_logits, dim=-1)  # (batch, n_basis)
 
